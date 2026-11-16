@@ -31,7 +31,7 @@ LoggingLevel = logging.DEBUG
 LOCAL_HOST = '127.0.0.1'
 
 # Default MEL command port that Maya listens
-DEFAULT_COMMAND_PORT = 50007
+DEFAULT_COMMAND_PORT = 60000
 
 
 logging.basicConfig(
