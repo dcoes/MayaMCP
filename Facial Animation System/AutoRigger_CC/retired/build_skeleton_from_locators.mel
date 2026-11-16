@@ -1,0 +1,680 @@
+// ============================================================================
+// build_skeleton_from_locators.mel
+//
+// Builds the game skeleton's joint hierarchy from locators that are already
+// placed in the scene. Expects locators named "<BoneName>_loc" (unsided,
+// as in your current list), or "<BoneName>_L_loc" / "<BoneName>_R_loc"
+// once mirroring is filled in.
+//
+// ORIENTATION: rather than computing each joint's orientation live (via an
+// aim constraint pointed at its child), jointOrient values are looked up
+// by base bone name from a table baked from VR_Skeleton_Example.ma and
+// applied directly with setAttr, right after each joint is created and
+// parented -- see GetReferenceOrient() / ApplyReferenceOrient() below.
+//
+// This replaced an earlier aim-constraint version. That approach turned
+// out not to match this reference skeleton at all, for reasons that only
+// showed up once the actual numbers were compared:
+//   - Root is identity in the reference (not aimed at Pelvis -- Pelvis
+//     itself carries the big rotation instead).
+//   - The twist joints are all identity too (Twist_01 does NOT aim at
+//     Twist_02, despite being its parent).
+//   - Head -- the leaf of the spine chain -- has a large, specific
+//     jointOrient, which contradicts "leaf stays at identity."
+//   - Shield_Offset and Hand_Offset both carry real, specific values
+//     that no generic aim-at-target rule would reproduce.
+// Copying the reference skeleton's own values directly sidesteps all of
+// that, and also removes the position-drift and aim/up-parallel bugs
+// that came with computing orientation live on a joint that already has
+// a positioned child hanging off it.
+//
+// SIDE-AWARE ENTRIES: Shoulder and UpperLeg are the first bone of a
+// mirrored limb, so _L and _R genuinely differ by ~180 degrees in the
+// reference (they point to opposite sides of the body) -- GetReferenceOrient
+// picks the correct one from $side for those two. Every joint further
+// down each limb is numerically identical between _L and _R in the
+// reference, so one shared value covers both sides there; getting
+// Shoulder/UpperLeg wrong previously (both sides pulling the _R value)
+// cascaded through everything parented below them, which is why one
+// whole side of the body looked mirrored-wrong while the other looked
+// fine. One exception: Shield_Offset has no _R counterpart in the
+// reference at all (only one arm carries a shield), so that entry is
+// still sourced from _L regardless of side -- worth another look once
+// mirroring assigns it a real side.
+//
+// ASYMMETRICAL LIMBS: positions always come straight from each locator,
+// so an intentionally-different limb (different pose, bend, whatever)
+// is already handled fine on that front. Orientation, by default, isn't
+// adaptive -- it's the fixed table value for that bone name/side,
+// regardless of what you actually did with the locator. For a limb that
+// needs to deviate on purpose, call SetCustomOrient(locatorName, x, y, z)
+// on that locator by hand before building; CreateChain checks for that
+// override first and only falls back to the table if it isn't present.
+// Everything else about the build -- positions, parenting, every other
+// bone -- stays exactly the same either way.
+//
+// USAGE:
+//     source "build_skeleton_from_locators.mel";
+//     BuildSkeleton();
+// ============================================================================
+
+
+// ---------------------------------------------------------------------------
+// PLACEHOLDER -- mirror the locators (fill in later)
+// ---------------------------------------------------------------------------
+// Plan: duplicate each mirror-able locator, negate world-space X, rename
+// with the swapped _L / _R suffix, so GetSides() below starts finding both
+// sides automatically. Left unimplemented for now -- called separately,
+// not from inside BuildSkeleton, so asymmetrical characters can still be
+// adjusted by hand before joints get built.
+//
+// global proc MirrorLocators(string $sourceSide)
+// {
+//     // TODO
+// }
+
+
+// ---------------------------------------------------------------------------
+// PLACEHOLDER -- snap locators onto a supplied CC4/AccuRig skeleton
+// ---------------------------------------------------------------------------
+// Plan: use the game-base -> CC-base map worked out earlier (Hips, Spine1,
+// Spine2, Arm, ForeArm, HandIndex1... and the guessed twist names like
+// RightArmTwist01, RightForeArmTwist01, RightUpLegTwist01) to snap each
+// locator onto its matching CC joint, if a CC skeleton is present in the
+// scene. Left unimplemented for now.
+//
+// global proc SnapLocatorsToCC(string $referenceSide)
+// {
+//     // TODO
+// }
+
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+// Creates a joint at a locator's world position. Deselects first so the
+// new joint doesn't auto-parent into whatever chain was last active.
+global proc string CreateJointAtLocator(string $locName, string $jointName)
+{
+    if (!`objExists $locName`)
+    {
+        warning ("Locator not found, skipping: " + $locName);
+        return "";
+    }
+    if (`objExists $jointName`)
+    {
+        warning ("Joint already exists, skipping: " + $jointName);
+        return $jointName;
+    }
+
+    float $pos[] = `xform -q -ws -t $locName`;
+    select -cl;
+    joint -p $pos[0] $pos[1] $pos[2] -n $jointName;
+    return $jointName;
+}
+
+
+// Parents $child under $parent without moving it in world space.
+// Safe to call even if either doesn't exist -- warns instead of erroring.
+global proc ParentJoint(string $child, string $parent)
+{
+    if ($child == "" || $parent == "")
+    {
+        return;
+    }
+    if (!`objExists $child` || !`objExists $parent`)
+    {
+        warning ("Cannot parent " + $child + " under " + $parent + " -- one doesn't exist.");
+        return;
+    }
+    parent $child $parent;
+}
+
+
+// Looks up the jointOrient (degrees) to use for a given base bone name,
+// baked from VR_Skeleton_Example.ma. Returns {0,0,0} and warns if the
+// base name isn't in the table.
+//
+// $side matters for exactly two entries: Shoulder and UpperLeg are the
+// first bone of a mirrored limb, so _L and _R genuinely differ by
+// ~180 degrees (they point to opposite sides of the body) -- every
+// other bone below is numerically identical between _L and _R in the
+// reference, so one shared value covers both sides for those. Unsided
+// callers ($side == "") get the _R value, matching how this was
+// originally tested against a single unsided test limb.
+global proc float[] GetReferenceOrient(string $baseName, string $side)
+{
+    float $orient[3] = {0.0, 0.0, 0.0};
+    int $found = 1;
+
+    if ($baseName == "Shoulder")
+    {
+        if ($side == "_L")
+        {
+            $orient[0] = 12.661865; $orient[1] = 7.529905; $orient[2] = -107.616468;
+        }
+        else
+        {
+            $orient[0] = -167.338114; $orient[1] = -7.52984; $orient[2] = -72.383767;
+        }
+        return $orient;
+    }
+    else if ($baseName == "UpperLeg")
+    {
+        if ($side == "_L")
+        {
+            $orient[0] = -1.704564; $orient[1] = -11.99098; $orient[2] = -171.848442;
+        }
+        else
+        {
+            $orient[0] = 178.295436; $orient[1] = 11.99098; $orient[2] = -8.15154;
+        }
+        return $orient;
+    }
+
+    if ($baseName == "Root")
+    {
+        $orient[0] = 0.0; $orient[1] = 0.0; $orient[2] = 0.0;
+    }
+    else if ($baseName == "Pelvis")
+    {
+        $orient[0] = 3e-06; $orient[1] = -16.216068; $orient[2] = 89.99999;
+    }
+    else if ($baseName == "Spine")
+    {
+        $orient[0] = 2e-05; $orient[1] = 20.053759; $orient[2] = 0.000114;
+    }
+    else if ($baseName == "Chest")
+    {
+        $orient[0] = -0.0; $orient[1] = -0.596904; $orient[2] = 7e-06;
+    }
+    else if ($baseName == "UpperChest")
+    {
+        $orient[0] = 1e-06; $orient[1] = 10.031924; $orient[2] = 1.6e-05;
+    }
+    else if ($baseName == "Neck")
+    {
+        $orient[0] = 1.2e-05; $orient[1] = -21.022232; $orient[2] = -6.4e-05;
+    }
+    else if ($baseName == "Head")
+    {
+        $orient[0] = -7.749522; $orient[1] = 0.0; $orient[2] = -90.000061;
+    }
+    else if ($baseName == "Jaw")
+    {
+        $orient[0] = 0.0; $orient[1] = 0.0; $orient[2] = 0.0;
+    }
+    else if ($baseName == "Eye")
+    {
+        $orient[0] = -5e-06; $orient[1] = 0.0; $orient[2] = 0.0;
+    }
+    else if ($baseName == "UpperArm")
+    {
+        $orient[0] = 0.973628; $orient[1] = -2.607676; $orient[2] = -24.604261;
+    }
+    else if ($baseName == "UpperArm_Twist_01")
+    {
+        $orient[0] = 2e-06; $orient[1] = 0.0; $orient[2] = 0.0;
+    }
+    else if ($baseName == "UpperArm_Twist_02")
+    {
+        $orient[0] = 2e-06; $orient[1] = 0.0; $orient[2] = 0.0;
+    }
+    else if ($baseName == "LowerArm")
+    {
+        $orient[0] = 0.450343; $orient[1] = -16.496503; $orient[2] = -0.886893;
+    }
+    else if ($baseName == "LowerArm_Twist_01")
+    {
+        $orient[0] = 3e-06; $orient[1] = 0.0; $orient[2] = 0.0;
+    }
+    else if ($baseName == "Hand")
+    {
+        $orient[0] = 3e-06; $orient[1] = 0.0; $orient[2] = 0.0;
+    }
+    else if ($baseName == "Hand_Twist_01")
+    {
+        $orient[0] = 3e-06; $orient[1] = 0.0; $orient[2] = 0.0;
+    }
+    else if ($baseName == "Hand_Offset")
+    {
+        $orient[0] = 66.159998; $orient[1] = -8.680518; $orient[2] = -90.392324;
+    }
+    else if ($baseName == "Shield_Offset")
+    {
+        $orient[0] = 90.000276; $orient[1] = -0.0; $orient[2] = -180.0;
+    }
+    else if ($baseName == "Thumb_1")
+    {
+        $orient[0] = 120.092117; $orient[1] = -50.101619; $orient[2] = -57.478639;
+    }
+    else if ($baseName == "Thumb_2")
+    {
+        $orient[0] = -0.708139; $orient[1] = 3.612768; $orient[2] = 0.126141;
+    }
+    else if ($baseName == "Thumb_3")
+    {
+        $orient[0] = -2.826731; $orient[1] = -1.536007; $orient[2] = -10.359879;
+    }
+    else if ($baseName == "Finger_1_0")
+    {
+        $orient[0] = -9.85455; $orient[1] = -17.768993; $orient[2] = -11.760682;
+    }
+    else if ($baseName == "Finger_1_1")
+    {
+        $orient[0] = 4.480742; $orient[1] = -3.349677; $orient[2] = -6.453452;
+    }
+    else if ($baseName == "Finger_1_2")
+    {
+        $orient[0] = -2.667965; $orient[1] = 0.844442; $orient[2] = -10.266213;
+    }
+    else if ($baseName == "Finger_1_3")
+    {
+        $orient[0] = 4.870751; $orient[1] = -1.305423; $orient[2] = 10.218344;
+    }
+    else if ($baseName == "Finger_2_0")
+    {
+        $orient[0] = -13.10338; $orient[1] = -1.701159; $orient[2] = -21.523976;
+    }
+    else if ($baseName == "Finger_2_1")
+    {
+        $orient[0] = -0.859194; $orient[1] = -2.183121; $orient[2] = -0.824841;
+    }
+    else if ($baseName == "Finger_2_2")
+    {
+        $orient[0] = 0.720885; $orient[1] = 3.613731; $orient[2] = -10.183112;
+    }
+    else if ($baseName == "Finger_2_3")
+    {
+        $orient[0] = -0.079783; $orient[1] = -0.182945; $orient[2] = 12.295663;
+    }
+    else if ($baseName == "Finger_3_0")
+    {
+        $orient[0] = -19.192493; $orient[1] = 14.26475; $orient[2] = -26.131489;
+    }
+    else if ($baseName == "Finger_3_1")
+    {
+        $orient[0] = -2.853103; $orient[1] = 1.117318; $orient[2] = -0.279506;
+    }
+    else if ($baseName == "Finger_3_2")
+    {
+        $orient[0] = 0.790174; $orient[1] = 2.378318; $orient[2] = -7.642977;
+    }
+    else if ($baseName == "Finger_3_3")
+    {
+        $orient[0] = -0.999743; $orient[1] = -4.632062; $orient[2] = 7.072839;
+    }
+    else if ($baseName == "Finger_4_0")
+    {
+        $orient[0] = -19.38449; $orient[1] = 27.429028; $orient[2] = -29.813453;
+    }
+    else if ($baseName == "Finger_4_1")
+    {
+        $orient[0] = -3.182586; $orient[1] = 5.693934; $orient[2] = -4.835648;
+    }
+    else if ($baseName == "Finger_4_2")
+    {
+        $orient[0] = 2.306996; $orient[1] = 0.465887; $orient[2] = -1.124402;
+    }
+    else if ($baseName == "Finger_4_3")
+    {
+        $orient[0] = -1.885605; $orient[1] = -3.528592; $orient[2] = 15.063337;
+    }
+    else if ($baseName == "UpperLeg_Twist_01")
+    {
+        $orient[0] = -0.134632; $orient[1] = -1.052748; $orient[2] = -0.684315;
+    }
+    else if ($baseName == "UpperLeg_Twist_02")
+    {
+        $orient[0] = 0.017817; $orient[1] = 0.137618; $orient[2] = 0.089926;
+    }
+    else if ($baseName == "LowerLeg")
+    {
+        $orient[0] = -0.478228; $orient[1] = 4.941777; $orient[2] = -1.362032;
+    }
+    else if ($baseName == "LowerLeg_Twist_01")
+    {
+        $orient[0] = 1.050198; $orient[1] = 0.0; $orient[2] = 0.0;
+    }
+    else if ($baseName == "Foot_Twist_01")
+    {
+        $orient[0] = 1.050198; $orient[1] = 0.0; $orient[2] = 0.0;
+    }
+    else if ($baseName == "Foot")
+    {
+        $orient[0] = -19.673232; $orient[1] = -74.767892; $orient[2] = 14.011305;
+    }
+    else if ($baseName == "Toes")
+    {
+        $orient[0] = 86.818041; $orient[1] = -23.079867; $orient[2] = 1.757089;
+    }
+    else
+    {
+        $found = 0;
+    }
+
+    if ($found == 0)
+    {
+        warning ("No reference orientation found for base bone: " + $baseName + " -- leaving at identity.");
+    }
+
+    return $orient;
+}
+
+
+// ---------------------------------------------------------------------------
+// Per-locator orientation override (for intentionally-asymmetric limbs)
+// ---------------------------------------------------------------------------
+
+// Call this by hand on any locator whose limb needs to deviate from the
+// reference table -- e.g. a character with one arm intentionally built
+// or posed differently from the other. Adds a "customOrient" double3
+// attribute to the locator (if it isn't there already) and sets it to
+// the given rotation in degrees. CreateChain picks this up automatically
+// (see ApplyReferenceOrient below) and uses it instead of
+// GetReferenceOrient for that one joint -- everything else about the
+// build (positions, parenting, every other bone) stays exactly the same.
+global proc SetCustomOrient(string $locName, float $x, float $y, float $z)
+{
+    if (!`objExists $locName`)
+    {
+        warning ("Cannot set custom orient -- locator does not exist: " + $locName);
+        return;
+    }
+    if (!`attributeQuery -node $locName -exists "customOrient"`)
+    {
+        addAttr -ln "customOrient" -at "double3" $locName;
+        addAttr -ln "customOrientX" -at "double" -p "customOrient" $locName;
+        addAttr -ln "customOrientY" -at "double" -p "customOrient" $locName;
+        addAttr -ln "customOrientZ" -at "double" -p "customOrient" $locName;
+    }
+    setAttr ($locName + ".customOrient") $x $y $z;
+}
+
+// True if $locName carries a customOrient override.
+global proc int HasCustomOrient(string $locName)
+{
+    if (!`objExists $locName`)
+    {
+        return 0;
+    }
+    return `attributeQuery -node $locName -exists "customOrient"`;
+}
+
+
+// Sets $joint's jointOrient. If $locName carries a customOrient override
+// (via SetCustomOrient), that value is used as-is; otherwise falls back
+// to the reference table, keyed by base bone name and side (Shoulder and
+// UpperLeg need the side to pick the right value; every other bone
+// ignores it). rotate is left at 0, matching how the reference skeleton
+// itself is built.
+global proc ApplyReferenceOrient(string $joint, string $baseName, string $side, string $locName)
+{
+    if (!`objExists $joint`)
+    {
+        warning ("Cannot orient -- joint does not exist: " + $joint);
+        return;
+    }
+
+    float $orient[3];
+    if (HasCustomOrient($locName))
+    {
+        $orient = `getAttr ($locName + ".customOrient")`;
+    }
+    else
+    {
+        $orient = GetReferenceOrient($baseName, $side);
+    }
+
+    setAttr ($joint + ".jointOrient") $orient[0] $orient[1] $orient[2];
+}
+
+
+// Builds a straight joint chain from a list of base bone names, in order,
+// reading "<base><side>_loc" and creating "<base><side>" joints, each
+// parented to the previous one. The first joint parents to $rootParent
+// (pass "" to leave it at the top of the hierarchy, e.g. for Root).
+//
+// Each joint's jointOrient is applied immediately after it's created and
+// parented -- before the next joint in the chain is created -- so every
+// subsequent locator position is read against its parent's *final*
+// orientation, and positions always land exactly on the locators no
+// matter what orientation gets baked in.
+global proc CreateChain(string $boneNames[], string $side, string $rootParent)
+{
+    string $prevJoint = $rootParent;
+    int $i;
+    for ($i = 0; $i < size($boneNames); $i++)
+    {
+        string $baseName  = $boneNames[$i];
+        string $locName   = $baseName + $side + "_loc";
+        string $jointName = $baseName + $side;
+
+        string $created = CreateJointAtLocator($locName, $jointName);
+        if ($created == "")
+        {
+            continue;
+        }
+        ParentJoint($created, $prevJoint);
+        ApplyReferenceOrient($created, $baseName, $side, $locName);
+        $prevJoint = $created;
+    }
+}
+
+
+// Checks which side suffix(es) exist for a given base bone name, by
+// looking for its locator. Returns {"_L","_R"}, {""}, a single-side
+// subset, or an empty array if nothing is found at all.
+global proc string[] GetSides(string $baseName)
+{
+    string $sides[];
+    if (`objExists ($baseName + "_L_loc")`)
+    {
+        $sides[size($sides)] = "_L";
+    }
+    if (`objExists ($baseName + "_R_loc")`)
+    {
+        $sides[size($sides)] = "_R";
+    }
+    if (size($sides) == 0 && `objExists ($baseName + "_loc")`)
+    {
+        $sides[size($sides)] = "";
+    }
+    return $sides;
+}
+
+
+// ---------------------------------------------------------------------------
+// Spine + head
+// ---------------------------------------------------------------------------
+
+global proc CreateSpineChain()
+{
+    // Root isn't in the numbered spec, but its locator is in the list and
+    // it's the standard role for a root bone, so it's folded into the
+    // chain itself (rootParent "" keeps it at the top of the hierarchy)
+    // rather than built separately. It comes out identity, matching the
+    // reference -- Root isn't aimed at Pelvis, Pelvis carries the
+    // rotation instead.
+    string $spineBones[] = {"Root", "Pelvis", "Spine", "Chest", "UpperChest", "Neck", "Head"};
+    CreateChain($spineBones, "", "");
+}
+
+global proc CreateHeadExtras()
+{
+    string $jawBones[] = {"Jaw"};
+    CreateChain($jawBones, "", "Head");
+
+    // Eye is mirror-able, so it goes through GetSides like everything
+    // else below, even though it's built as a single joint per side.
+    string $eyeSides[] = GetSides("Eye");
+    int $i;
+    for ($i = 0; $i < size($eyeSides); $i++)
+    {
+        string $eyeBones[] = {"Eye"};
+        CreateChain($eyeBones, $eyeSides[$i], "Head");
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Arms
+// ---------------------------------------------------------------------------
+
+global proc CreateArmChains()
+{
+    string $sides[] = GetSides("Shoulder");
+    int $i;
+    for ($i = 0; $i < size($sides); $i++)
+    {
+        string $side = $sides[$i];
+        string $armBones[] = {"Shoulder", "UpperArm", "LowerArm", "Hand"};
+        CreateChain($armBones, $side, "UpperChest");
+    }
+}
+
+global proc CreateArmTwistJoints()
+{
+    string $sides[] = GetSides("UpperArm");
+    int $i;
+    for ($i = 0; $i < size($sides); $i++)
+    {
+        string $side = $sides[$i];
+
+        // UpperArm_Twist_01 -> UpperArm_Twist_02 is a 2-joint mini
+        // chain for parenting purposes, but both come out identity in
+        // the reference -- they don't aim at each other.
+        string $upperTwist[] = {"UpperArm_Twist_01", "UpperArm_Twist_02"};
+        CreateChain($upperTwist, $side, "UpperArm" + $side);
+
+        string $lowerTwist[] = {"LowerArm_Twist_01"};
+        CreateChain($lowerTwist, $side, "LowerArm" + $side);
+
+        string $handTwist[] = {"Hand_Twist_01"};
+        CreateChain($handTwist, $side, "Hand" + $side);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Legs
+// ---------------------------------------------------------------------------
+
+global proc CreateLegChains()
+{
+    string $sides[] = GetSides("UpperLeg");
+    int $i;
+    for ($i = 0; $i < size($sides); $i++)
+    {
+        string $side = $sides[$i];
+        string $legBones[] = {"UpperLeg", "LowerLeg", "Foot", "Toes"};
+        CreateChain($legBones, $side, "Pelvis");
+    }
+}
+
+global proc CreateLegTwistJoints()
+{
+    string $sides[] = GetSides("UpperLeg");
+    int $i;
+    for ($i = 0; $i < size($sides); $i++)
+    {
+        string $side = $sides[$i];
+
+        string $upperTwist[] = {"UpperLeg_Twist_01", "UpperLeg_Twist_02"};
+        CreateChain($upperTwist, $side, "UpperLeg" + $side);
+
+        string $lowerTwist[] = {"LowerLeg_Twist_01"};
+        CreateChain($lowerTwist, $side, "LowerLeg" + $side);
+
+        string $footTwist[] = {"Foot_Twist_01"};
+        CreateChain($footTwist, $side, "Foot" + $side);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Fingers (including thumb)
+// ---------------------------------------------------------------------------
+
+global proc CreateFingerChains()
+{
+    string $sides[] = GetSides("Hand");
+    int $i;
+    for ($i = 0; $i < size($sides); $i++)
+    {
+        string $side = $sides[$i];
+
+        string $thumbBones[] = {"Thumb_1", "Thumb_2", "Thumb_3"};
+        CreateChain($thumbBones, $side, "Hand" + $side);
+
+        string $finger1[] = {"Finger_1_0", "Finger_1_1", "Finger_1_2", "Finger_1_3"};
+        CreateChain($finger1, $side, "Hand" + $side);
+
+        string $finger2[] = {"Finger_2_0", "Finger_2_1", "Finger_2_2", "Finger_2_3"};
+        CreateChain($finger2, $side, "Hand" + $side);
+
+        string $finger3[] = {"Finger_3_0", "Finger_3_1", "Finger_3_2", "Finger_3_3"};
+        CreateChain($finger3, $side, "Hand" + $side);
+
+        string $finger4[] = {"Finger_4_0", "Finger_4_1", "Finger_4_2", "Finger_4_3"};
+        CreateChain($finger4, $side, "Hand" + $side);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Hand offset / shield offset
+// ---------------------------------------------------------------------------
+
+global proc CreateHandOffset()
+{
+    string $sides[] = GetSides("Hand");
+    int $i;
+    for ($i = 0; $i < size($sides); $i++)
+    {
+        string $side = $sides[$i];
+        string $handOffsetBones[] = {"Hand_Offset"};
+        CreateChain($handOffsetBones, $side, "Hand" + $side);
+    }
+}
+
+global proc CreateShieldOffset()
+{
+    string $sides[] = GetSides("LowerArm");
+    int $i;
+    for ($i = 0; $i < size($sides); $i++)
+    {
+        string $side = $sides[$i];
+        string $shieldOffsetBones[] = {"Shield_Offset"};
+        CreateChain($shieldOffsetBones, $side, "LowerArm" + $side);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Master
+// ---------------------------------------------------------------------------
+
+global proc BuildSkeleton()
+{
+    CreateSpineChain();
+    CreateHeadExtras();
+
+    CreateArmChains();
+    CreateArmTwistJoints();
+
+    CreateLegChains();
+    CreateLegTwistJoints();
+
+    CreateFingerChains();
+
+    CreateHandOffset();
+    CreateShieldOffset();
+
+    print("Skeleton build complete.\n");
+}
+
+
+// Run when sourced.
+BuildSkeleton();

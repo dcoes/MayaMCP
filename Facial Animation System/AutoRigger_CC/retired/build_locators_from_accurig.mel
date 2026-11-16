@@ -1,0 +1,384 @@
+// ---------------------------------------------------------------------------
+// build_locators_from_accurig.mel
+//
+// Creates the game skeleton's locators (as found in BoneLocators.ma, but
+// bilateral ones now suffixed _L / _R) positioned at the world-space
+// translation of the matching bone in an imported AccuRig / CC4 skeleton
+// (e.g. Reallusion_Example_Skeleton.ma).
+//
+// METHOD: for each mapped bone, spaceLocator is created, then pointConstraint
+// snaps it to the AccuRig joint's world position, then the constraint is
+// deleted -- leaving a clean, unconstrained locator.
+//
+// This script is self-contained (no "source" of other files required).
+//
+// USAGE (Maya Script Editor, MEL tab):
+//     "source" below just loads THIS file's own proc definitions into Maya
+//     -- it does not pull in or depend on any other script. Sourcing it
+//     runs BuildLocatorsFromAccurig("", "") automatically with defaults.
+//     Only call it again yourself if you need a prefix or namespace:
+//
+//     source "build_locators_from_accurig.mel";       // runs with defaults
+//     BuildLocatorsFromAccurig("", "Character1");      // namespaced rig, if needed
+//
+// NOTES / JUDGMENT CALLS (flag these to the user, don't just assume silently):
+//   - The naming actually found in Reallusion_Example_Skeleton.ma
+//     ("CC_Base_Hip", "CC_Base_L_Thigh", etc.) does NOT match the source
+//     names used in rename_accurig_to_game_skeleton.mel (which assumes
+//     Mixamo/HumanIK-style names like "LeftUpLeg"). This script's mapping
+//     tables were built directly from the actual AccuRig export naming,
+//     independent of that other script's table.
+//   - Spine chain: AccuRig's chain under Hip is
+//         Pelvis, Waist, Spine01, Spine02, NeckTwist01, NeckTwist02, Head
+//     but the game chain is only
+//         Pelvis, Spine, Chest, UpperChest, Neck, Head  (6 bones, not 7).
+//     Mapping used: Pelvis->Pelvis, Spine->Waist, Chest->Spine01,
+//     UpperChest->Spine02, Neck->NeckTwist01, Head->Head.
+//     CC_Base_NeckTwist02 has no game-side equivalent and is intentionally
+//     skipped -- if you'd rather Neck_loc land on NeckTwist02 instead,
+//     that's a one-line change in CenterAccurigNames() below.
+//   - Root has no AccuRig counterpart (matches notCoveredByAccurig() in
+//     rename_accurig_to_game_skeleton.mel) -- Root_loc is still created,
+//     just left at the origin, and flagged in the report.
+//   - Foot_Twist_01 and Hand_Twist_01 have no AccuRig counterpart either,
+//     but per correction: both should simply sit at the same position as
+//     their nearest main joint (ankle for Foot_Twist_01, wrist for
+//     Hand_Twist_01) -- so they're mapped directly onto Foot / Hand,
+//     same as Foot_loc / Hand_loc themselves.
+//   - Hand_Offset and Shield_Offset have no direct AccuRig joint either,
+//     but we DO have enough info to derive a position for them, so they're
+//     handled separately (see CreateMidpointLocator below):
+//       Hand_Offset_loc   -> midpoint of Hand (wrist) and Mid1 (first
+//                            joint of the middle finger), per prior chat.
+//       Shield_Offset_loc -> midpoint of Forearm (elbow) and Hand (wrist).
+//   - Finger tips (Finger_X_3): the VR skeleton has 4 joints per finger,
+//     AccuRig only rigs 3 (no fingertip bone). Per correction: project the
+//     missing tip outward from the last known joint (e.g. Index3), in the
+//     same direction as the segment before it (Index2 -> Index3), by half
+//     that segment's length -- see CreateProjectedTipLocator below. This
+//     is a placeholder; expect to nudge it manually afterward.
+//   - Twist-count mismatch rule: AccuRig gives some segments two twist
+//     joints (e.g. ThighTwist01/02) while the VR skeleton's locator list
+//     only has one numbered twist for others (e.g. LowerArm_Twist_01 has
+//     no "_02" counterpart, even though AccuRig's ForearmTwist02 exists).
+//     Where the game side only defines one numbered twist locator for a
+//     segment, this script maps it to AccuRig's FIRST twist joint only
+//     (Twist01) and intentionally ignores any extra AccuRig twist joints
+//     beyond that -- already applied to LowerArm_Twist_01 -> ForearmTwist01
+//     and LowerLeg_Twist_01 -> CalfTwist01 below.
+// ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// Center (unsided) bones: locator base name  <->  AccuRig joint name.
+// Parallel arrays. "" in the AccuRig column means "no counterpart -- leave
+// the locator at the origin".
+// ---------------------------------------------------------------------------
+global proc string[] CenterLocNames()
+{
+    string $names[] = {
+        "Root", "Pelvis", "Spine", "Chest", "UpperChest", "Neck", "Head", "Jaw"
+    };
+    return $names;
+}
+
+global proc string[] CenterAccurigNames()
+{
+    string $names[] = {
+        "",                      // Root       -- no AccuRig counterpart
+        "CC_Base_Pelvis",        // Pelvis
+        "CC_Base_Waist",         // Spine
+        "CC_Base_Spine01",       // Chest
+        "CC_Base_Spine02",       // UpperChest
+        "CC_Base_NeckTwist01",   // Neck
+        "CC_Base_Head",          // Head
+        "CC_Base_JawRoot"        // Jaw
+    };
+    return $names;
+}
+
+
+// ---------------------------------------------------------------------------
+// Bilateral bones: locator base name  <->  AccuRig base name.
+// Full AccuRig joint name is built as "CC_Base_" + <L|R> + "_" + base.
+// "" in the AccuRig column means "no counterpart -- leave the locator at
+// the origin".
+// ---------------------------------------------------------------------------
+global proc string[] SidedLocNames()
+{
+    string $names[] = {
+        "Eye",
+        "Shoulder", "UpperArm", "UpperArm_Twist_01", "UpperArm_Twist_02",
+        "LowerArm", "LowerArm_Twist_01", "Hand", "Hand_Twist_01",
+        "Thumb_1", "Thumb_2", "Thumb_3",
+        "Finger_1_0", "Finger_1_1", "Finger_1_2",
+        "Finger_2_0", "Finger_2_1", "Finger_2_2",
+        "Finger_3_0", "Finger_3_1", "Finger_3_2",
+        "Finger_4_0", "Finger_4_1", "Finger_4_2",
+        "UpperLeg", "UpperLeg_Twist_01", "UpperLeg_Twist_02",
+        "LowerLeg", "LowerLeg_Twist_01", "Foot_Twist_01",
+        "Foot", "Toes"
+    };
+    return $names;
+}
+
+global proc string[] SidedAccurigBaseNames()
+{
+    string $names[] = {
+        "Eye",
+        "Clavicle", "Upperarm", "UpperarmTwist01", "UpperarmTwist02",
+        "Forearm", "ForearmTwist01", "Hand", "Hand",
+        "Thumb1", "Thumb2", "Thumb3",
+        "Index1", "Index2", "Index3",
+        "Mid1", "Mid2", "Mid3",
+        "Ring1", "Ring2", "Ring3",
+        "Pinky1", "Pinky2", "Pinky3",
+        "Thigh", "ThighTwist01", "ThighTwist02",
+        "Calf", "CalfTwist01", "Foot",
+        "Foot", "ToeBase"
+    };
+    return $names;
+}
+
+
+// ---------------------------------------------------------------------------
+// CreateLocatorFromJoint(locName, jointName)
+//
+// Creates locName (a spaceLocator) if it doesn't already exist, then, if
+// jointName is non-empty and exists in the scene, snaps it to that joint's
+// world position via a temporary pointConstraint. Returns a one-line status
+// string for the summary report.
+// ---------------------------------------------------------------------------
+global proc string CreateLocatorFromJoint(string $locName, string $jointName)
+{
+    if (`objExists $locName`)
+    {
+        return ("SKIPPED (already exists): " + $locName);
+    }
+
+    spaceLocator -n $locName;
+
+    if ($jointName == "")
+    {
+        return ("NO SOURCE -- left at origin: " + $locName);
+    }
+
+    if (!`objExists $jointName`)
+    {
+        return ("MISSING SOURCE '" + $jointName + "' -- left at origin: " + $locName);
+    }
+
+    string $con[] = `pointConstraint $jointName $locName`;
+    delete $con;
+
+    return ("OK: " + $locName + "  <-  " + $jointName);
+}
+
+
+// ---------------------------------------------------------------------------
+// CreateMidpointLocator(locName, jointA, jointB)
+//
+// For locators with no single matching AccuRig joint but a well-defined
+// position between two joints (Hand_Offset, Shield_Offset). Creates locName
+// if needed, then places it at the world-space midpoint of jointA/jointB.
+// Rotation is left at identity either way -- matches "Hand_Offset stays
+// zeroed out" from prior discussion, and Shield_Offset's own orientation
+// is handled later by the joint-building script (OrientJointToChild), not
+// by this locator-placement step.
+// ---------------------------------------------------------------------------
+global proc string CreateMidpointLocator(string $locName, string $jointA, string $jointB)
+{
+    if (`objExists $locName`)
+    {
+        return ("SKIPPED (already exists): " + $locName);
+    }
+
+    spaceLocator -n $locName;
+
+    if (!`objExists $jointA` || !`objExists $jointB`)
+    {
+        return ("MISSING SOURCE '" + $jointA + "' / '" + $jointB
+                 + "' -- left at origin: " + $locName);
+    }
+
+    float $posA[] = `xform -q -ws -t $jointA`;
+    float $posB[] = `xform -q -ws -t $jointB`;
+
+    float $mid[] = {
+        ($posA[0] + $posB[0]) * 0.5,
+        ($posA[1] + $posB[1]) * 0.5,
+        ($posA[2] + $posB[2]) * 0.5
+    };
+
+    xform -ws -t $mid[0] $mid[1] $mid[2] $locName;
+
+    return ("OK (midpoint): " + $locName + "  <-  " + $jointA + " / " + $jointB);
+}
+
+
+// ---------------------------------------------------------------------------
+// CreateProjectedTipLocator(locName, jointNear, jointFar)
+//
+// For the finger-tip locators (Finger_X_3) that AccuRig has no joint for at
+// all -- it only rigs 3 finger joints per finger, the VR skeleton wants 4.
+// Extrapolates past jointFar (e.g. Index3) in the same direction as the
+// jointNear->jointFar segment (e.g. Index2->Index3), by half that segment's
+// length. This is a placeholder position, expected to be nudged by hand
+// afterward -- but keeps the tip roughly aligned and roughly proportioned
+// instead of sitting at the origin.
+// ---------------------------------------------------------------------------
+global proc string CreateProjectedTipLocator(string $locName, string $jointNear, string $jointFar)
+{
+    if (`objExists $locName`)
+    {
+        return ("SKIPPED (already exists): " + $locName);
+    }
+
+    spaceLocator -n $locName;
+
+    if (!`objExists $jointNear` || !`objExists $jointFar`)
+    {
+        return ("MISSING SOURCE '" + $jointNear + "' / '" + $jointFar
+                 + "' -- left at origin: " + $locName);
+    }
+
+    float $posNear[] = `xform -q -ws -t $jointNear`;
+    float $posFar[]  = `xform -q -ws -t $jointFar`;
+
+    float $tip[] = {
+        $posFar[0] + ($posFar[0] - $posNear[0]) * 0.5,
+        $posFar[1] + ($posFar[1] - $posNear[1]) * 0.5,
+        $posFar[2] + ($posFar[2] - $posNear[2]) * 0.5
+    };
+
+    xform -ws -t $tip[0] $tip[1] $tip[2] $locName;
+
+    return ("OK (projected tip): " + $locName + "  <-  " + $jointNear + " -> " + $jointFar);
+}
+
+
+// ---------------------------------------------------------------------------
+// BuildLocatorsFromAccurig(prefix, namespace)
+//
+// prefix:    string prepended to AccuRig joint names in your scene, e.g.
+//            "" (the Reallusion_Example_Skeleton.ma names already carry
+//            the "CC_Base_" part, so this is normally left empty).
+// namespace: Maya namespace on the imported rig, e.g. "Character1"
+//            (joints appear as "Character1:CC_Base_L_Thigh" etc).
+//            Pass "" for none.
+// ---------------------------------------------------------------------------
+global proc BuildLocatorsFromAccurig(string $prefix, string $namespace)
+{
+    string $report[];
+    int $reportCount = 0;
+
+    string $nsPrefix = "";
+    if ($namespace != "")
+    {
+        $nsPrefix = $namespace + ":";
+    }
+
+    // --- Center / unsided bones ---
+    string $centerLoc[]     = CenterLocNames();
+    string $centerAccurig[] = CenterAccurigNames();
+
+    int $i;
+    for ($i = 0; $i < size($centerLoc); $i++)
+    {
+        string $locName = $centerLoc[$i] + "_loc";
+
+        string $jointName = "";
+        if ($centerAccurig[$i] != "")
+        {
+            $jointName = $nsPrefix + $prefix + $centerAccurig[$i];
+        }
+
+        $report[$reportCount] = CreateLocatorFromJoint($locName, $jointName);
+        $reportCount++;
+    }
+
+    // --- Bilateral bones, both sides ---
+    string $sidedLoc[]     = SidedLocNames();
+    string $sidedAccurig[] = SidedAccurigBaseNames();
+
+    string $sides[] = {"L", "R"};
+    int $s;
+    for ($s = 0; $s < size($sides); $s++)
+    {
+        string $side = $sides[$s];
+
+        for ($i = 0; $i < size($sidedLoc); $i++)
+        {
+            string $locName = $sidedLoc[$i] + "_" + $side + "_loc";
+
+            string $jointName = "";
+            if ($sidedAccurig[$i] != "")
+            {
+                $jointName = $nsPrefix + $prefix + "CC_Base_" + $side + "_" + $sidedAccurig[$i];
+            }
+
+            $report[$reportCount] = CreateLocatorFromJoint($locName, $jointName);
+            $reportCount++;
+        }
+
+        // Hand_Offset / Shield_Offset: no single matching AccuRig joint,
+        // but a clear midpoint definition from prior discussion.
+        string $handJoint     = $nsPrefix + $prefix + "CC_Base_" + $side + "_Hand";
+        string $forearmJoint  = $nsPrefix + $prefix + "CC_Base_" + $side + "_Forearm";
+        string $mid1Joint     = $nsPrefix + $prefix + "CC_Base_" + $side + "_Mid1";
+
+        $report[$reportCount] = CreateMidpointLocator(
+            "Hand_Offset_" + $side + "_loc", $handJoint, $mid1Joint);
+        $reportCount++;
+
+        $report[$reportCount] = CreateMidpointLocator(
+            "Shield_Offset_" + $side + "_loc", $forearmJoint, $handJoint);
+        $reportCount++;
+
+        // Finger tips (Finger_X_3): projected past the last known AccuRig
+        // joint of each finger, since AccuRig only rigs 3 joints per finger.
+        string $fingerGameNames[] = {"Finger_1", "Finger_2", "Finger_3", "Finger_4"};
+        string $fingerAccurigBases[] = {"Index", "Mid", "Ring", "Pinky"};
+
+        int $f;
+        for ($f = 0; $f < size($fingerGameNames); $f++)
+        {
+            string $nearJoint = $nsPrefix + $prefix + "CC_Base_" + $side + "_" + $fingerAccurigBases[$f] + "2";
+            string $farJoint  = $nsPrefix + $prefix + "CC_Base_" + $side + "_" + $fingerAccurigBases[$f] + "3";
+            string $tipLoc    = $fingerGameNames[$f] + "_3_" + $side + "_loc";
+
+            $report[$reportCount] = CreateProjectedTipLocator($tipLoc, $nearJoint, $farJoint);
+            $reportCount++;
+        }
+    }
+
+    // --- Summary ---
+    int $okCount = 0;
+    int $warnCount = 0;
+
+    print("\n--- BuildLocatorsFromAccurig report ---\n");
+    for ($line in $report)
+    {
+        print($line + "\n");
+        if (`substring $line 1 2` == "OK")
+        {
+            $okCount++;
+        }
+        else
+        {
+            $warnCount++;
+        }
+    }
+    print("\nPositioned from AccuRig: " + $okCount + " / " + $reportCount + "\n");
+    print("Need manual placement or review: " + $warnCount + " / " + $reportCount + "\n");
+    print("----------------------------------------\n\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// Run automatically when sourced, using defaults (no prefix, no namespace).
+// If your AccuRig rig has a prefix or lives under a namespace, comment this
+// line out and call BuildLocatorsFromAccurig(...) manually with the right
+// arguments instead.
+// ---------------------------------------------------------------------------
+BuildLocatorsFromAccurig("", "");

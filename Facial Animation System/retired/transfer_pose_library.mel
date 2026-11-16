@@ -1,0 +1,383 @@
+// ---------------------------------------------------------------------------
+// transfer_pose_library.mel
+//
+// NEW-CHARACTER STARTING POINT — a visual workflow, not a data transfer.
+//
+// The transferred poses are written AS KEYS ON THE POSE FRAMES of the new
+// character's timeline. The artist then scrubs the 30 frames, judges each
+// pose on the new face BY EYE, re-sculpts whatever anatomy breaks, and runs
+// the normal CaptureAllPoseFrames. The automated scaling below is only the
+// pencil sketch; nothing enters the library until the artist captures it.
+//
+// Two steps, two scenes:
+//
+//   In the SOURCE scene (e.g. the human), face at rest:
+//     ExportPoseLibraryRaw("C:/path/human_poses.raw");
+//
+//   In the TARGET scene (bare/preview skeleton of the new character, at rest):
+//     TransferPoseLibrary("C:/path/human_poses.raw", 0);
+//     // -> Neutral keyed at frame 0, each pose keyed at its frame map slot.
+//     // Review/fix frames visually, then: CaptureAllPoseFrames(0);
+//
+// Scaling starting point: rotations copy as-is; translations scale by facial
+// proportions measured off the two skeletons (mouth width for the mouth/cheek
+// region, eye spacing for the eye/brow region). Every pose frame keys ALL
+// facial bone channels (uninvolved bones keyed at neutral), so frames never
+// bleed into each other and recapture is exact.
+//
+// Conventions: plain PascalCase procs, fully self-contained.
+// ---------------------------------------------------------------------------
+
+
+// --------- self-contained copies of the shared helpers ---------------------
+global proc string[] FacePoseBones()
+{
+    string $bones[] = {
+        "Jaw", "UpperLip_Mid", "LowerLip_Mid", "Brow0_Mid",
+        "Eye_L", "Eye_R",
+        "UpperEyelid_L", "UpperEyelid_R",
+        "LowerEyelid_L", "LowerEyelid_R",
+        "Brow0_L", "Brow0_R",
+        "Brow1_L", "Brow1_R",
+        "CheekBone_L", "CheekBone_R",
+        "LipCorner_L", "LipCorner_R"
+    };
+    // per-character extras registered via AddFacialBone (face_pose_tools.mel)
+    if (`objExists "FacePoseLib"` && `attributeExists "extraBones" "FacePoseLib"`)
+    {
+        string $extra = `getAttr "FacePoseLib.extraBones"`;
+        string $tok[];
+        tokenize($extra, " ", $tok);
+        for ($t in $tok)
+        {
+            if ($t != "")
+                $bones[size($bones)] = $t;
+        }
+    }
+    return $bones;
+}
+
+global proc string[] FacePoseNames()
+{
+    string $poses[] = {
+        "JawOpen",
+        "Smile_L", "Smile_R", "Frown_L", "Frown_R",
+        "MouthWide_L", "MouthWide_R", "MouthNarrow_L", "MouthNarrow_R",
+        "UpperLipRaise", "LowerLipDown",
+        "BrowUp_L", "BrowUp_R", "BrowSad_L", "BrowSad_R",
+        "BrowAngry_L", "BrowAngry_R",
+        "Blink_L", "Blink_R", "EyeWide_L", "EyeWide_R",
+        "Squint_L", "Squint_R",
+        "EyesUp", "EyesDown", "EyesLeft", "EyesRight",
+        "CheekRaise_L", "CheekRaise_R"
+    };
+    return $poses;
+}
+
+global proc string LoadFacePoseData(string $poseName)
+{
+    string $node = "FPose_" + $poseName;
+    if (!`objExists $node`) return "";
+    if (!`attributeExists "poseData" $node`) return "";
+    string $data = `getAttr ($node + ".poseData")`;
+    return $data;
+}
+
+global proc string ResolveFaceBone(string $bone)
+{
+    string $matches[] = `ls -long $bone`;
+    if (size($matches) == 0)
+        error("ResolveFaceBone: '" + $bone + "' does not exist in this scene.");
+    if (size($matches) > 1)
+    {
+        string $list = stringArrayToString($matches, "\n  ");
+        error("ResolveFaceBone: '" + $bone + "' is NOT UNIQUE — "
+              + size($matches) + " objects share this name:\n  " + $list
+              + "\nRename one in the Outliner so facial bone names are unique, then retry.");
+    }
+    return $matches[0];
+}
+// ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// World-space distance between two bones (for proportion measurements).
+// Returns -1 if either bone is missing.
+// ---------------------------------------------------------------------------
+global proc float FaceMeasure(string $boneA, string $boneB)
+{
+    if (!`objExists $boneA` || !`objExists $boneB`) return -1.0;
+    string $fullA = ResolveFaceBone($boneA);
+    string $fullB = ResolveFaceBone($boneB);
+    float $a[] = `xform -q -ws -t $fullA`;
+    float $b[] = `xform -q -ws -t $fullB`;
+    float $dx = $a[0] - $b[0];
+    float $dy = $a[1] - $b[1];
+    float $dz = $a[2] - $b[2];
+    return sqrt($dx*$dx + $dy*$dy + $dz*$dz);
+}
+
+
+// ---------------------------------------------------------------------------
+// Which proportion measurement scales a bone's translation deltas.
+// Returns "mouth", "eye", or "none".
+// ---------------------------------------------------------------------------
+global proc string FaceBoneRegion(string $bone)
+{
+    if (`gmatch $bone "*Lip*"` || `gmatch $bone "*Cheek*"` || `gmatch $bone "Jaw*"`)
+        return "mouth";
+    if (`gmatch $bone "*Eye*"` || `gmatch $bone "*Brow*"`)
+        return "eye";
+    return "none";
+}
+
+
+// ---------------------------------------------------------------------------
+// STEP 1 — run in the SOURCE scene, face at rest.
+// Writes the captured library + proportion measurements to a plain text file.
+// ---------------------------------------------------------------------------
+global proc ExportPoseLibraryRaw(string $path)
+{
+    string $neutral = LoadFacePoseData("Neutral");
+    if ($neutral == "")
+        error "ExportPoseLibraryRaw: no Neutral in the pose library. Capture the library first.";
+
+    float $mouth = FaceMeasure("LipCorner_L", "LipCorner_R");
+    float $eye   = FaceMeasure("Eye_L", "Eye_R");
+    if ($mouth <= 0 || $eye <= 0)
+        warning "ExportPoseLibraryRaw: could not measure mouth/eye width — target will fall back to unscaled translations.";
+
+    string $out = "#measure mouth " + $mouth + "\n";
+    $out += "#measure eye " + $eye + "\n";
+
+    string $poses[] = FacePoseNames();
+    int $count = 0;
+    for ($p in $poses)
+    {
+        string $d = LoadFacePoseData($p);
+        if ($d == "")
+        {
+            warning("ExportPoseLibraryRaw: no data for pose '" + $p + "' — skipped.");
+            continue;
+        }
+        $out += "=" + $p + "\n" + $d;
+        $count++;
+    }
+
+    int $fileId = `fopen $path "w"`;
+    if ($fileId == 0)
+        error("ExportPoseLibraryRaw: could not open for writing: " + $path);
+    fprint $fileId $out;
+    fclose $fileId;
+
+    print("ExportPoseLibraryRaw: wrote " + $count + " poses + measurements to " + $path + "\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// Key ALL facial bone channels at a frame. $deltaBones/$deltas describe one
+// pose (6 values per bone, already scaled); everything else keys at neutral.
+// $tgtBones/$tgtNeutral are parallel: 6 floats per bone.
+// ---------------------------------------------------------------------------
+global proc KeyFacePoseFrame(int $frame,
+                             string $tgtBones[], float $tgtNeutral[],
+                             string $deltaBones[], float $deltas[])
+{
+    string $chanLong[] = { "translateX", "translateY", "translateZ",
+                           "rotateX", "rotateY", "rotateZ" };
+
+    for ($bi = 0; $bi < size($tgtBones); $bi++)
+    {
+        string $bone = $tgtBones[$bi];   // full DAG path
+        string $shortParts[];
+        tokenize($bone, "|", $shortParts);
+        string $shortName = $shortParts[size($shortParts) - 1];
+
+        // find this bone's delta block, if the pose touches it (match by
+        // short name — the parsed file only knows short names)
+        int $di = -1;
+        for ($k = 0; $k < size($deltaBones); $k++)
+        {
+            if ($deltaBones[$k] == $shortName) { $di = $k; break; }
+        }
+
+        for ($c = 0; $c < 6; $c++)
+        {
+            float $v = $tgtNeutral[$bi * 6 + $c];
+            if ($di >= 0)
+                $v += $deltas[$di * 6 + $c];
+            string $attr = $bone + "." + $chanLong[$c];
+            if (`getAttr -settable $attr`)
+            {
+                setKeyframe -time $frame -value $v $attr;
+            }
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// STEP 2 — run in the TARGET scene (bare/preview skeleton, face at rest).
+// Reads the raw file and keys Neutral + every pose onto the frame map for
+// visual review. Follow with manual fixes, then CaptureAllPoseFrames.
+// ---------------------------------------------------------------------------
+global proc TransferPoseLibrary(string $path, int $startFrame)
+{
+    // --- target neutral, measured from the scene as it sits right now ---
+    string $allBones[] = FacePoseBones();
+    string $tgtBones[];
+    float  $tgtNeutral[];
+    string $chanLong[] = { "translateX", "translateY", "translateZ",
+                           "rotateX", "rotateY", "rotateZ" };
+
+    for ($b in $allBones)
+    {
+        if (!`objExists $b`)
+        {
+            warning("TransferPoseLibrary: target has no bone '" + $b + "' — its motion will be dropped.");
+            continue;
+        }
+        int $bi = size($tgtBones);
+        int $bi = size($tgtBones);
+        string $full = ResolveFaceBone($b);
+        $tgtBones[$bi] = $full;
+        for ($c = 0; $c < 6; $c++)
+            $tgtNeutral[$bi * 6 + $c] = `getAttr ($full + "." + $chanLong[$c])`;
+    }
+    if (size($tgtBones) == 0)
+        error "TransferPoseLibrary: no facial bones found in this scene.";
+
+    // --- proportion ratios ---
+    float $tgtMouth = FaceMeasure("LipCorner_L", "LipCorner_R");
+    float $tgtEye   = FaceMeasure("Eye_L", "Eye_R");
+    float $srcMouth = -1.0;
+    float $srcEye   = -1.0;
+
+    // --- read the raw file ---
+    int $fileId = `fopen $path "r"`;
+    if ($fileId == 0)
+        error("TransferPoseLibrary: could not open: " + $path);
+
+    string $poses[] = FacePoseNames();
+
+    string $curPose = "";
+    string $curBones[];
+    float  $curDeltas[];
+    int $keyedPoses = 0;
+
+    // measurements first pass happens inline; ratios resolved lazily below
+    float $mouthRatio = 1.0;
+    float $eyeRatio   = 1.0;
+    int $ratiosReady = 0;
+
+    string $line = `fgetline $fileId`;
+    while (size($line) > 0)
+    {
+        string $trimmed = strip($line);
+        string $tok[];
+        int $n = tokenize($trimmed, " ", $tok);
+
+        if ($n == 3 && $tok[0] == "#measure")
+        {
+            if ($tok[1] == "mouth") $srcMouth = (float) $tok[2];
+            if ($tok[1] == "eye")   $srcEye   = (float) $tok[2];
+        }
+        else if ($n >= 1 && `gmatch $trimmed "=*"`)
+        {
+            // flush the previous pose
+            if ($curPose != "")
+            {
+                int $idx = -1;
+                for ($i = 0; $i < size($poses); $i++)
+                    if ($poses[$i] == $curPose) { $idx = $i; break; }
+                if ($idx >= 0)
+                {
+                    KeyFacePoseFrame(($startFrame + 1 + $idx),
+                                     $tgtBones, $tgtNeutral,
+                                     $curBones, $curDeltas);
+                    $keyedPoses++;
+                }
+                else
+                    warning("TransferPoseLibrary: unknown pose in file: " + $curPose);
+            }
+
+            if (!$ratiosReady)
+            {
+                if ($srcMouth > 0 && $tgtMouth > 0) $mouthRatio = $tgtMouth / $srcMouth;
+                if ($srcEye > 0 && $tgtEye > 0)     $eyeRatio   = $tgtEye / $srcEye;
+                print("TransferPoseLibrary: translation scale — mouth region x"
+                      + $mouthRatio + ", eye region x" + $eyeRatio + "\n");
+                $ratiosReady = 1;
+            }
+
+            $curPose = substring($trimmed, 2, size($trimmed));
+            clear $curBones;
+            clear $curDeltas;
+        }
+        else if ($n == 7)
+        {
+            string $bone = $tok[0];
+            string $region = FaceBoneRegion($bone);
+            float $tScale = 1.0;
+            if ($region == "mouth") $tScale = $mouthRatio;
+            if ($region == "eye")   $tScale = $eyeRatio;
+
+            int $di = size($curBones);
+            $curBones[$di] = $bone;
+            for ($c = 0; $c < 6; $c++)
+            {
+                float $v = (float) $tok[$c + 1];
+                if ($c < 3) $v *= $tScale;       // translations scale
+                                                  // rotations copy as-is
+                $curDeltas[$di * 6 + $c] = $v;
+            }
+        }
+
+        $line = `fgetline $fileId`;
+    }
+    fclose $fileId;
+
+    // flush the last pose
+    if ($curPose != "")
+    {
+        int $idx = -1;
+        for ($i = 0; $i < size($poses); $i++)
+            if ($poses[$i] == $curPose) { $idx = $i; break; }
+        if ($idx >= 0)
+        {
+            KeyFacePoseFrame(($startFrame + 1 + $idx),
+                             $tgtBones, $tgtNeutral,
+                             $curBones, $curDeltas);
+            $keyedPoses++;
+        }
+    }
+
+    // Neutral keyed at the start frame (all bones at target rest)
+    string $noBones[];
+    float $noDeltas[];
+    KeyFacePoseFrame($startFrame, $tgtBones, $tgtNeutral, $noBones, $noDeltas);
+
+    playbackOptions -min $startFrame -max ($startFrame + size($poses));
+    currentTime $startFrame;
+
+    print("\nTransferPoseLibrary: keyed Neutral + " + $keyedPoses
+          + " poses onto frames " + $startFrame + "-" + ($startFrame + size($poses)) + ".\n");
+    print("NOW REVIEW BY EYE: scrub each frame, re-sculpt any pose the new\n");
+    print("anatomy breaks, then run CaptureAllPoseFrames(" + $startFrame + ");\n\n");
+}
+
+
+// ---------------------------------------------------------------------------
+global proc TransferPoseLibraryHelp()
+{
+    print("\n=========== transfer_pose_library.mel ===========\n");
+    print("SOURCE scene (face at rest):\n");
+    print("  ExportPoseLibraryRaw(\"C:/path/human_poses.raw\");\n");
+    print("TARGET scene (bare skeleton, face at rest):\n");
+    print("  TransferPoseLibrary(\"C:/path/human_poses.raw\", 0);\n");
+    print("  // review each frame visually, fix, then:\n");
+    print("  CaptureAllPoseFrames(0);   // from face_pose_tools.mel\n");
+    print("==================================================\n\n");
+}
+
+TransferPoseLibraryHelp();

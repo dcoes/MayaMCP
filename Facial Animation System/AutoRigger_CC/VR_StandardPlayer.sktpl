@@ -1,0 +1,21 @@
+# VR StandardPlayer skeleton template.
+#
+# The joint lines are not here yet: open your VR reference skeleton scene
+# (the one the old jointOrient table was baked from, VR_Skeleton_Example.ma),
+# select its top joint (Root) and press "Capture Template" with this file
+# chosen. Capture keeps the #place rules below.
+#
+# Rules for joints a CC4 / AccuRig source can't supply (from the old
+# build_locators_from_accurig.mel). {S} expands to L and R.
+#place Root origin
+#place Hand_Twist_01_{S} at Hand_{S}
+#place Foot_Twist_01_{S} at Foot_{S}
+#place Hand_Offset_{S} mid Hand_{S} Finger_2_0_{S}
+#place Shield_Offset_{S} mid LowerArm_{S} Hand_{S}
+#place Finger_1_3_{S} extend Finger_1_1_{S} Finger_1_2_{S} 0.5
+#place Finger_2_3_{S} extend Finger_2_1_{S} Finger_2_2_{S} 0.5
+#place Finger_3_3_{S} extend Finger_3_1_{S} Finger_3_2_{S} 0.5
+#place Finger_4_3_{S} extend Finger_4_1_{S} Finger_4_2_{S} 0.5
+# The old locator script put Pelvis on CC_Base_Pelvis, while the matchers
+# (and the old rename script) use CC_Base_Hip. Uncomment to keep the old spot:
+##place Pelvis src CC_Base_Pelvis

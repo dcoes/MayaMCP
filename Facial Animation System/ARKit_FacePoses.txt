@@ -1,0 +1,50 @@
+# ARKit_FacePoses.txt
+#
+# Starter preset: the 29 face poses as mixes of the 52 Apple ARKit
+# blendshapes. Use it on a blendshape head with ARKit-named targets:
+#     AddFaceShapesFromSelection();   (select the head mesh)
+#     SaveNeutral();                  (all sliders at 0)
+#     ApplyShapePreset("C:/path/ARKit_FacePoses.txt");
+#
+# Format:  PoseName=target:weight target:weight ...
+# "Left" in ARKit names is the character's own left, same as _L here.
+# This is a starting point. Preview every pose, and recapture any that
+# don't read right on your character (dial the sliders, CapturePose(N)).
+# Copy this file and rename the targets for other naming schemes (CC4 etc).
+
+# Mouth
+JawOpen=jawOpen:1.0
+Smile_L=mouthSmileLeft:1.0 cheekSquintLeft:0.3
+Smile_R=mouthSmileRight:1.0 cheekSquintRight:0.3
+Frown_L=mouthFrownLeft:1.0
+Frown_R=mouthFrownRight:1.0
+MouthWide_L=mouthStretchLeft:1.0
+MouthWide_R=mouthStretchRight:1.0
+MouthNarrow_L=mouthPucker:0.5
+MouthNarrow_R=mouthPucker:0.5
+UpperLipRaise=mouthUpperUpLeft:1.0 mouthUpperUpRight:1.0
+LowerLipDown=mouthLowerDownLeft:1.0 mouthLowerDownRight:1.0
+
+# Brows
+BrowUp_L=browOuterUpLeft:1.0 browInnerUp:0.5
+BrowUp_R=browOuterUpRight:1.0 browInnerUp:0.5
+BrowSad_L=browInnerUp:0.5
+BrowSad_R=browInnerUp:0.5
+BrowAngry_L=browDownLeft:1.0
+BrowAngry_R=browDownRight:1.0
+
+# Eyes
+Blink_L=eyeBlinkLeft:1.0
+Blink_R=eyeBlinkRight:1.0
+EyeWide_L=eyeWideLeft:1.0
+EyeWide_R=eyeWideRight:1.0
+Squint_L=eyeSquintLeft:1.0
+Squint_R=eyeSquintRight:1.0
+EyesUp=eyeLookUpLeft:1.0 eyeLookUpRight:1.0
+EyesDown=eyeLookDownLeft:1.0 eyeLookDownRight:1.0
+EyesLeft=eyeLookOutLeft:1.0 eyeLookInRight:1.0
+EyesRight=eyeLookInLeft:1.0 eyeLookOutRight:1.0
+
+# Cheeks
+CheekRaise_L=cheekSquintLeft:1.0
+CheekRaise_R=cheekSquintRight:1.0

@@ -1,0 +1,351 @@
+// ---------------------------------------------------------------------------
+// IMPORTANT - EXPORT AS MOTION BUILDER FORMAT from CC4
+
+
+//
+// convert_cc4_skeleton_names.mel
+//
+// Renames a raw CC4/AccuRig skeleton straight to the exact VR skeleton
+// joint names, so it can serve as a Copy Skin Weights source (name
+// association) for any mesh already bound to it.
+//
+// Source of truth: accurig_locator_mapping_reference.md, which was verified
+// against the actual joint names in Reallusion_Example_Skeleton.ma. This is
+// NOT the same table as rename_accurig_to_game_skeleton.mel -- that one
+// assumed Mixamo/HumanIK-style names (Hips, LeftArm, ...) which do not
+// exist on a real AccuRig export. This script uses the real
+// CC_Base_[Side_]BaseName convention instead.
+//
+// Two things handled as special cases, per direct scene inspection:
+//   - Root: "CC_Base_BoneRoot" -> "Root_TempConversion" (no VR equivalent,
+//     just needs a name that won't collide with the production skeleton's
+//     own "Root").
+//   - Pelvis: the doc's original mapping was CC_Base_Pelvis -> Pelvis, but
+//     CC_Base_Pelvis has no skin weights on the mesh being checked --
+//     CC_Base_Hip is the joint actually driving deformation, so THAT is
+//     the one renamed to "Pelvis" here. CC_Base_Pelvis is left untouched
+//     (see comment below) until this is confirmed either way.
+//
+// USAGE:
+//     source "convert_cc4_skeleton_names.mel";
+//     ConvertCC4SkeletonNames("", "", false);       // default
+//     ConvertCC4SkeletonNames("", "Character1", true);  // dry run, namespaced
+// ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// Center (unsided) bones. CC_Base_Pelvis is deliberately NOT in this list --
+// see note above and at the bottom of the proc.
+// ---------------------------------------------------------------------------
+global proc string[] cc4RealSourceNamesCenter()
+{
+    string $names[] = {
+        "CC_Base_Hip",          // treated as Pelvis -- see note above
+        "CC_Base_Waist",
+        "CC_Base_Spine01",
+        "CC_Base_Spine02",
+        "CC_Base_NeckTwist01",
+        "CC_Base_Head",
+        "CC_Base_JawRoot"
+    };
+    return $names;
+}
+
+global proc string[] cc4RealTargetNamesCenter()
+{
+    string $names[] = {
+        "Pelvis",
+        "Spine",
+        "Chest",
+        "UpperChest",
+        "Neck",
+        "Head",
+        "Jaw"
+    };
+    return $names;
+}
+
+
+// ---------------------------------------------------------------------------
+// Bilateral bones. Real AccuRig side convention: CC_Base_L_<Base> /
+// CC_Base_R_<Base>, e.g. CC_Base_L_Upperarm. Game/VR side convention:
+// <Base>_L / <Base>_R.
+// ---------------------------------------------------------------------------
+global proc string[] cc4RealSourceNamesSided(string $side)
+{
+    string $names[] = {
+        "CC_Base_" + $side + "_Eye",
+        "CC_Base_" + $side + "_Clavicle",
+        "CC_Base_" + $side + "_Upperarm",
+        "CC_Base_" + $side + "_UpperarmTwist01",
+        "CC_Base_" + $side + "_UpperarmTwist02",
+        "CC_Base_" + $side + "_Forearm",
+        "CC_Base_" + $side + "_ForearmTwist01",
+        "CC_Base_" + $side + "_Hand",
+        "CC_Base_" + $side + "_Thumb1",
+        "CC_Base_" + $side + "_Thumb2",
+        "CC_Base_" + $side + "_Thumb3",
+        "CC_Base_" + $side + "_Index1",
+        "CC_Base_" + $side + "_Index2",
+        "CC_Base_" + $side + "_Index3",
+        "CC_Base_" + $side + "_Mid1",
+        "CC_Base_" + $side + "_Mid2",
+        "CC_Base_" + $side + "_Mid3",
+        "CC_Base_" + $side + "_Ring1",
+        "CC_Base_" + $side + "_Ring2",
+        "CC_Base_" + $side + "_Ring3",
+        "CC_Base_" + $side + "_Pinky1",
+        "CC_Base_" + $side + "_Pinky2",
+        "CC_Base_" + $side + "_Pinky3",
+        "CC_Base_" + $side + "_Thigh",
+        "CC_Base_" + $side + "_ThighTwist01",
+        "CC_Base_" + $side + "_ThighTwist02",
+        "CC_Base_" + $side + "_Calf",
+        "CC_Base_" + $side + "_CalfTwist01",
+        "CC_Base_" + $side + "_Foot",
+        "CC_Base_" + $side + "_ToeBase"
+    };
+    return $names;
+}
+
+global proc string[] cc4RealTargetNamesSided(string $side)
+{
+    string $names[] = {
+        "Eye_"               + $side,
+        "Shoulder_"          + $side,
+        "UpperArm_"          + $side,
+        "UpperArm_Twist_01_" + $side,
+        "UpperArm_Twist_02_" + $side,
+        "LowerArm_"          + $side,
+        "LowerArm_Twist_01_" + $side,
+        "Hand_"              + $side,
+        "Thumb_1_"           + $side,
+        "Thumb_2_"           + $side,
+        "Thumb_3_"           + $side,
+        "Finger_1_0_"        + $side,
+        "Finger_1_1_"        + $side,
+        "Finger_1_2_"        + $side,
+        "Finger_2_0_"        + $side,
+        "Finger_2_1_"        + $side,
+        "Finger_2_2_"        + $side,
+        "Finger_3_0_"        + $side,
+        "Finger_3_1_"        + $side,
+        "Finger_3_2_"        + $side,
+        "Finger_4_0_"        + $side,
+        "Finger_4_1_"        + $side,
+        "Finger_4_2_"        + $side,
+        "UpperLeg_"          + $side,
+        "UpperLeg_Twist_01_" + $side,
+        "UpperLeg_Twist_02_" + $side,
+        "LowerLeg_"          + $side,
+        "LowerLeg_Twist_01_" + $side,
+        "Foot_"              + $side,
+        "Toes_"              + $side
+    };
+    return $names;
+}
+
+
+// ---------------------------------------------------------------------------
+// Bones confirmed present in real CC4/AccuRig exports that have NO VR
+// skeleton equivalent. Not renamed, not treated as errors -- listed here
+// purely so the end-of-run report can say "accounted for" instead of
+// leaving them unexplained. Confirmed against two actual exported bone
+// lists (RL_BoneRoot variant and CC_Base_BoneRoot variant).
+// ---------------------------------------------------------------------------
+global proc string[] cc4KnownExtraBonesNoVREquivalent()
+{
+    string $names[] = {
+        // Unused duplicate twist joints (VR skeleton only uses one per limb)
+        "CC_Base_NeckTwist02",
+        "CC_Base_L_ForearmTwist02", "CC_Base_R_ForearmTwist02",
+        "CC_Base_L_CalfTwist02",    "CC_Base_R_CalfTwist02",
+
+        // Helper "share bone" joints (blend helpers, not real deform bones)
+        "CC_Base_L_KneeShareBone",  "CC_Base_R_KneeShareBone",
+        "CC_Base_L_ElbowShareBone", "CC_Base_R_ElbowShareBone",
+        "CC_Base_L_ToeBaseShareBone", "CC_Base_R_ToeBaseShareBone",
+
+        // Individual toes (VR skeleton has one Toes_L/R joint, not five each)
+        "CC_Base_L_BigToe1", "CC_Base_L_IndexToe1", "CC_Base_L_MidToe1",
+        "CC_Base_L_RingToe1", "CC_Base_L_PinkyToe1",
+        "CC_Base_R_BigToe1", "CC_Base_R_IndexToe1", "CC_Base_R_MidToe1",
+        "CC_Base_R_RingToe1", "CC_Base_R_PinkyToe1",
+
+        // Face/torso extras with no VR equivalent at all
+        "CC_Base_FacialBone", "CC_Base_UpperJaw",
+        "CC_Base_Tongue01", "CC_Base_Tongue02", "CC_Base_Tongue03",
+        "CC_Base_Teeth01", "CC_Base_Teeth02",
+        "CC_Base_L_RibsTwist", "CC_Base_R_RibsTwist",
+        "CC_Base_L_Breast", "CC_Base_R_Breast"
+    };
+    return $names;
+}
+
+
+
+//
+// prefix:    prepended to every lookup name, e.g. "" (usually not needed --
+//            CC_Base_ is already baked into the tables above).
+// namespace: Maya namespace on the skeleton, e.g. "Character1". "" for none.
+// dryRun:    if true, only prints what WOULD happen, renames nothing.
+// ---------------------------------------------------------------------------
+global proc ConvertCC4SkeletonNames(string $prefix, string $namespace, int $dryRun)
+{
+    string $renamed[];
+    string $missing[];
+    int $renamedCount = 0;
+    int $missingCount = 0;
+
+    string $nsPrefix = "";
+    if ($namespace != "")
+    {
+        $nsPrefix = $namespace + ":";
+    }
+
+    // --- Root: rename out of the way, no VR equivalent to match ---
+    // Different CC4/AccuRig exports name this differently -- try both.
+    string $rootCandidates[] = { "CC_Base_BoneRoot", "RL_BoneRoot" };
+    int $rootFound = 0;
+    for ($r = 0; $r < size($rootCandidates); $r++)
+    {
+        string $rootLookup = $nsPrefix + $prefix + $rootCandidates[$r];
+        if (`objExists $rootLookup`)
+        {
+            if ($dryRun)
+            {
+                print("[DRY RUN] " + $rootLookup + " -> Root_TempConversion\n");
+            }
+            else
+            {
+                rename $rootLookup "Root_TempConversion";
+            }
+            $renamed[$renamedCount] = $rootCandidates[$r]; $renamedCount++;
+            $rootFound = 1;
+            break;
+        }
+    }
+    if (!$rootFound)
+    {
+        $missing[$missingCount] = $nsPrefix + $prefix + "CC_Base_BoneRoot (or RL_BoneRoot)"; $missingCount++;
+    }
+
+    // --- Center bones (includes CC_Base_Hip -> Pelvis, see file header) ---
+    string $centerSrc[] = cc4RealSourceNamesCenter();
+    string $centerTgt[] = cc4RealTargetNamesCenter();
+    int $centerCount = size($centerSrc);
+    for ($i = 0; $i < $centerCount; $i++)
+    {
+        string $lookupName = $nsPrefix + $prefix + $centerSrc[$i];
+        if (`objExists $lookupName`)
+        {
+            if ($dryRun)
+            {
+                print("[DRY RUN] " + $lookupName + " -> " + $centerTgt[$i] + "\n");
+            }
+            else
+            {
+                rename $lookupName $centerTgt[$i];
+            }
+            $renamed[$renamedCount] = $centerSrc[$i]; $renamedCount++;
+        }
+        else
+        {
+            $missing[$missingCount] = $lookupName; $missingCount++;
+        }
+    }
+
+    // --- Bilateral bones, both sides ---
+    string $sides[] = { "L", "R" };
+    for ($s = 0; $s < 2; $s++)
+    {
+        string $side = $sides[$s];
+        string $sidedSrc[] = cc4RealSourceNamesSided($side);
+        string $sidedTgt[] = cc4RealTargetNamesSided($side);
+        int $sidedCount = size($sidedSrc);
+        for ($i = 0; $i < $sidedCount; $i++)
+        {
+            string $lookupName = $nsPrefix + $prefix + $sidedSrc[$i];
+            if (`objExists $lookupName`)
+            {
+                if ($dryRun)
+                {
+                    print("[DRY RUN] " + $lookupName + " -> " + $sidedTgt[$i] + "\n");
+                }
+                else
+                {
+                    rename $lookupName $sidedTgt[$i];
+                }
+                $renamed[$renamedCount] = $sidedSrc[$i]; $renamedCount++;
+            }
+            else
+            {
+                $missing[$missingCount] = $lookupName; $missingCount++;
+            }
+        }
+    }
+
+    print("\n--- ConvertCC4SkeletonNames report ---\n");
+    if ($dryRun)
+    {
+        print("*** DRY RUN -- NOTHING WAS ACTUALLY RENAMED ***\n");
+        print("Would rename/match: " + $renamedCount + "\n");
+    }
+    else
+    {
+        print("Actually renamed: " + $renamedCount + "\n");
+    }
+
+    if ($missingCount > 0)
+    {
+        print("\nNot found in scene (check namespace/prefix, or rig is incomplete):\n");
+        for ($m in $missing)
+        {
+            print("  " + $m + "\n");
+        }
+    }
+
+    string $extras[] = cc4KnownExtraBonesNoVREquivalent();
+    string $extrasFound[];
+    int $extrasFoundCount = 0;
+    for ($e = 0; $e < size($extras); $e++)
+    {
+        string $extraLookup = $nsPrefix + $prefix + $extras[$e];
+        if (`objExists $extraLookup`)
+        {
+            $extrasFound[$extrasFoundCount] = $extras[$e]; $extrasFoundCount++;
+        }
+    }
+    print("\n" + $extrasFoundCount + " bones found with no VR equivalent (twist\n");
+    print("duplicates, ShareBones, individual toes, face/torso extras) --\n");
+    print("left untouched, not an error:\n");
+    for ($ef in $extrasFound)
+    {
+        print("  " + $ef + "\n");
+    }
+
+    // NOTE: CC_Base_Pelvis intentionally left untouched. It appeared to have
+    // no skin weights on the mesh checked -- CC_Base_Hip was renamed to
+    // "Pelvis" instead since it's the joint actually driving deformation.
+    // Revisit this once confirmed: if CC_Base_Pelvis turns out to matter
+    // (e.g. a different mesh does use it), this mapping needs rethinking --
+    // don't just also rename it to "Pelvis", that would collide.
+    print("\nCC_Base_Pelvis was left untouched (not renamed) -- unconfirmed\n");
+    print("whether it's actually used for deformation. See comment in this\n");
+    print("script before deciding what, if anything, to do with it.\n");
+    print("---------------------------------------\n\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// RUN IT
+//
+// Select this ENTIRE file's text in the Script Editor (MEL tab) and execute
+// it as one action (Ctrl+Enter, or the Execute button). That both defines
+// every proc above AND runs the line below, in the same step -- no separate
+// "source" command needed, no risk of an old cached version still being
+// the one that runs.
+//
+// Change the last argument to true first if you want a dry run/preview.
+// ---------------------------------------------------------------------------
+ConvertCC4SkeletonNames("", "", false);

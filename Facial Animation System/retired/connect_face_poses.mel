@@ -1,0 +1,278 @@
+// ---------------------------------------------------------------------------
+// connect_face_poses.mel
+//
+// LIVE PREVIEW NETWORK — visual feedback for weight-curve animation in Maya.
+//
+//   ConnectFacePoses();      // build the network: bones now follow the
+//                            // FacePoses weight attributes live in the viewport
+//   DisconnectFacePoses();   // tear it down cleanly, restore neutral
+//
+// What it builds: for every bone channel any pose touches,
+//     channel = neutral + Sum( weight_i * delta_i )
+// as a plusMinusAverage fed by one multDoubleLinear per contributing pose —
+// the exact math the Unity runtime performs, live in Maya. Scrub weight keys
+// (or drag the attributes / use Studio Library on the FacePoses node) and the
+// face performs.
+//
+// Requirements:
+//   - A captured pose library in-scene (FacePoseLib nodes + Neutral) —
+//     see face_pose_tools.mel.
+//   - The FacePoses node (CreateFacePosesNode).
+//   - Run on a bare/preview skeleton: channels already driven by the control
+//     rig's constraints or by bone keys are DETECTED and SKIPPED (warned).
+//
+// Everything created is tracked in an objectSet "FacePosesPreviewSet" so
+// teardown is one delete. The network is a PREVIEW tool — disconnect before
+// exporting or saving the production file.
+//
+// Conventions: plain PascalCase procs, fully self-contained (helper procs
+// below are identical copies of the ones in face_pose_tools.mel).
+// ---------------------------------------------------------------------------
+
+
+// --------- self-contained copies of the shared helpers ---------------------
+global proc string[] FacePoseBones()
+{
+    string $bones[] = {
+        "Jaw", "UpperLip_Mid", "LowerLip_Mid", "Brow0_Mid",
+        "Eye_L", "Eye_R",
+        "UpperEyelid_L", "UpperEyelid_R",
+        "LowerEyelid_L", "LowerEyelid_R",
+        "Brow0_L", "Brow0_R",
+        "Brow1_L", "Brow1_R",
+        "CheekBone_L", "CheekBone_R",
+        "LipCorner_L", "LipCorner_R"
+    };
+    // per-character extras registered via AddFacialBone (face_pose_tools.mel)
+    if (`objExists "FacePoseLib"` && `attributeExists "extraBones" "FacePoseLib"`)
+    {
+        string $extra = `getAttr "FacePoseLib.extraBones"`;
+        string $tok[];
+        tokenize($extra, " ", $tok);
+        for ($t in $tok)
+        {
+            if ($t != "")
+                $bones[size($bones)] = $t;
+        }
+    }
+    return $bones;
+}
+
+global proc string[] FacePoseNames()
+{
+    string $poses[] = {
+        "JawOpen",
+        "Smile_L", "Smile_R", "Frown_L", "Frown_R",
+        "MouthWide_L", "MouthWide_R", "MouthNarrow_L", "MouthNarrow_R",
+        "UpperLipRaise", "LowerLipDown",
+        "BrowUp_L", "BrowUp_R", "BrowSad_L", "BrowSad_R",
+        "BrowAngry_L", "BrowAngry_R",
+        "Blink_L", "Blink_R", "EyeWide_L", "EyeWide_R",
+        "Squint_L", "Squint_R",
+        "EyesUp", "EyesDown", "EyesLeft", "EyesRight",
+        "CheekRaise_L", "CheekRaise_R"
+    };
+    return $poses;
+}
+
+global proc string LoadFacePoseData(string $poseName)
+{
+    string $node = "FPose_" + $poseName;
+    if (!`objExists $node`) return "";
+    if (!`attributeExists "poseData" $node`) return "";
+    string $data = `getAttr ($node + ".poseData")`;
+    return $data;
+}
+
+global proc float[] FaceNeutralFor(string $bone)
+{
+    float $empty[];
+    string $data = LoadFacePoseData("Neutral");
+    if ($data == "")
+    {
+        error "No Neutral in the pose library. Capture the library first (face_pose_tools.mel).";
+    }
+    string $lines[];
+    tokenize($data, "\n", $lines);
+    for ($line in $lines)
+    {
+        string $tok[];
+        int $n = tokenize($line, " ", $tok);
+        if ($n == 7 && $tok[0] == $bone)
+        {
+            float $v[6];
+            for ($i = 0; $i < 6; $i++)
+                $v[$i] = (float) $tok[$i + 1];
+            return $v;
+        }
+    }
+    return $empty;
+}
+
+global proc string ResolveFaceBone(string $bone)
+{
+    string $matches[] = `ls -long $bone`;
+    if (size($matches) == 0)
+        error("ResolveFaceBone: '" + $bone + "' does not exist in this scene.");
+    if (size($matches) > 1)
+    {
+        string $list = stringArrayToString($matches, "\n  ");
+        error("ResolveFaceBone: '" + $bone + "' is NOT UNIQUE — "
+              + size($matches) + " objects share this name:\n  " + $list
+              + "\nRename one in the Outliner so facial bone names are unique, then retry.");
+    }
+    return $matches[0];
+}
+// ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// Build the live preview network.
+// ---------------------------------------------------------------------------
+global proc ConnectFacePoses()
+{
+    if (!`objExists "FacePoses"`)
+        error "ConnectFacePoses: no 'FacePoses' node. Run CreateFacePosesNode() first.";
+    if (LoadFacePoseData("Neutral") == "")
+        error "ConnectFacePoses: no pose library in scene. Capture it first (face_pose_tools.mel).";
+    if (`objExists "FacePosesPreviewSet"`)
+        error "ConnectFacePoses: preview network already connected. Run DisconnectFacePoses() first.";
+
+    string $set = `sets -em -name "FacePosesPreviewSet"`;
+
+    string $chanLong[]  = { "translateX", "translateY", "translateZ",
+                            "rotateX", "rotateY", "rotateZ" };
+    string $chanShort[] = { "tx", "ty", "tz", "rx", "ry", "rz" };
+
+    string $skipped[];
+    int $mulCount = 0;
+    int $chanCount = 0;
+    int $poseCount = 0;
+
+    string $poses[] = FacePoseNames();
+    for ($p in $poses)
+    {
+        string $data = LoadFacePoseData($p);
+        if ($data == "") continue;
+        if (!`attributeExists $p "FacePoses"`)
+        {
+            warning("ConnectFacePoses: FacePoses has no '" + $p + "' attribute — pose skipped. Re-run CreateFacePosesNode().");
+            continue;
+        }
+        $poseCount++;
+
+        string $lines[];
+        tokenize($data, "\n", $lines);
+        for ($line in $lines)
+        {
+            string $tok[];
+            int $n = tokenize($line, " ", $tok);
+            if ($n != 7) continue;
+
+            string $bone = $tok[0];
+            if (!`objExists $bone`) continue;
+            string $full = ResolveFaceBone($bone);
+            float $neutral[] = FaceNeutralFor($bone);
+            if (size($neutral) == 0) continue;
+
+            for ($c = 0; $c < 6; $c++)
+            {
+                float $delta = (float) $tok[$c + 1];
+                if (abs($delta) < 1e-9) continue;
+
+                string $attr = $full + "." + $chanLong[$c];
+                string $pma  = "FPsum_" + $bone + "_" + $chanShort[$c];
+
+                if (!`objExists $pma`)
+                {
+                    // First pose touching this channel: claim it, unless
+                    // something else (constraint, anim curve) already drives it.
+                    if (`connectionInfo -isDestination $attr`)
+                    {
+                        $skipped[size($skipped)] = $attr;
+                        continue;
+                    }
+                    createNode "plusMinusAverage" -name $pma;
+                    setAttr ($pma + ".input1D[0]") $neutral[$c];
+                    connectAttr ($pma + ".output1D") $attr;
+                    sets -add $set $pma;
+                    $chanCount++;
+                }
+
+                int $idx = `getAttr -size ($pma + ".input1D")`;
+                string $mul = `createNode "multDoubleLinear"`;
+                connectAttr ("FacePoses." + $p) ($mul + ".input1");
+                setAttr ($mul + ".input2") $delta;
+                connectAttr ($mul + ".output") ($pma + ".input1D[" + $idx + "]");
+                sets -add $set $mul;
+                $mulCount++;
+            }
+        }
+    }
+
+    print("ConnectFacePoses: live. " + $poseCount + " poses driving "
+          + $chanCount + " bone channels (" + $mulCount + " contributions).\n");
+    print("Scrub the timeline or drag FacePoses attributes to preview.\n");
+
+    if (size($skipped) > 0)
+    {
+        string $unique[] = stringArrayRemoveDuplicates($skipped);
+        warning("ConnectFacePoses: " + size($unique) + " channels already driven (constraints/keys) and were SKIPPED — preview on a bare skeleton, or remove those inputs first:");
+        for ($s in $unique) print("  skipped: " + $s + "\n");
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Tear the network down and put the face back at Neutral.
+// ---------------------------------------------------------------------------
+global proc DisconnectFacePoses()
+{
+    if (!`objExists "FacePosesPreviewSet"`)
+    {
+        warning "DisconnectFacePoses: no preview network in scene.";
+        return;
+    }
+
+    string $members[] = `sets -q "FacePosesPreviewSet"`;
+    if (size($members) > 0)
+        delete $members;
+    delete "FacePosesPreviewSet";
+
+    // Deleting the network leaves bones at their last evaluated values —
+    // restore Neutral on anything we can set.
+    string $chanLong[] = { "translateX", "translateY", "translateZ",
+                           "rotateX", "rotateY", "rotateZ" };
+    string $bones[] = FacePoseBones();
+    for ($b in $bones)
+    {
+        if (!`objExists $b`) continue;
+        string $full = ResolveFaceBone($b);
+        float $neutral[] = FaceNeutralFor($b);
+        if (size($neutral) == 0) continue;
+        for ($c = 0; $c < 6; $c++)
+        {
+            string $attr = $full + "." + $chanLong[$c];
+            if (`getAttr -settable $attr`)
+                setAttr $attr $neutral[$c];
+        }
+    }
+
+    print("DisconnectFacePoses: network removed (" + size($members)
+          + " nodes), face restored to Neutral.\n");
+}
+
+
+// ---------------------------------------------------------------------------
+global proc ConnectFacePosesHelp()
+{
+    print("\n============ connect_face_poses.mel ============\n");
+    print("  ConnectFacePoses();      // bones follow FacePoses weights live\n");
+    print("  DisconnectFacePoses();   // remove network, restore neutral\n");
+    print("Use on a bare/preview skeleton. Driven channels are skipped\n");
+    print("with a warning. Studio Library on the FacePoses node works\n");
+    print("naturally while connected (pose thumbnails, blending).\n");
+    print("================================================\n\n");
+}
+
+ConnectFacePosesHelp();

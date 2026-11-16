@@ -1,0 +1,1654 @@
+// ---------------------------------------------------------------------------
+// face_pose_tools.mel
+//
+// Facial pose library authoring — POSE-BY-POSE WORKFLOW (no timeline needed).
+//
+//   PoseTable();                     // the number <-> pose table
+//   SaveNeutral();                   // 1. face at rest, run once
+//   // 2. sculpt a pose: controls, or apply a Studio Library pose.
+//   //    No keyframes needed — capture reads the face as it sits.
+//   CapturePose(2);                  // 3. capture current face as pose #2 (Smile_L)
+//   // repeat 2-3 for each pose (reset your controls between poses)
+//   MirrorPose(2);                   // optional: builds Smile_R from Smile_L
+//   MirrorPoseLeftToRight(N); / MirrorPoseRightToLeft(N);   // explicit direction
+//   PreviewPose(2, 1.0);             // check a captured pose (bare skeleton)
+//   ResetFace();                     // bones back to neutral
+//   LibraryStatus();                 // which poses are captured vs MISSING
+//   SaveLibraryFile("C:/path/human.flib");   // SAVE YOUR WORK to disk!
+//   LoadLibraryFile("C:/path/human.flib");   // restore into any scene
+//   CreateFacePosesNode();           // 29 weight attrs under Root (for FBX)
+//   ExportPoseLibrary("C:/path/face_poses_Human.json", "Human");  // for Unity
+//
+// The library lives on nodes INSIDE the scene file (FacePoseLib group). It is
+// only as safe as the scene it's in — SaveLibraryFile after capturing, always.
+//
+// A pose's bone membership is automatic: capture diffs all facial bones
+// against Neutral; whatever moved past a tiny epsilon is stored.
+// Captures that find NOTHING moved are NOT saved (loud warning instead).
+//
+// New characters (ogre, elf...): your control rigs are universal — swap the
+// referenced character, apply your Studio Library control poses, adjust by
+// eye, CapturePose(N) each one, SaveLibraryFile under the new name.
+//
+// Timeline route (optional, kept for compatibility): key poses on frames
+// 0-29 per PoseTable and run CaptureAllPoseFrames(0). Pose-by-pose above is
+// the recommended path.
+//
+// Conventions: plain PascalCase procs, fully self-contained, no source deps.
+// ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// The CORE facial bone set (18 bones, every character). EyeSocket excluded.
+// ---------------------------------------------------------------------------
+global proc string[] CoreFaceBones()
+{
+    string $bones[] = {
+        "Jaw", "UpperLip_Mid", "LowerLip_Mid", "Brow0_Mid",
+        "Eye_L", "Eye_R",
+        "UpperEyelid_L", "UpperEyelid_R",
+        "LowerEyelid_L", "LowerEyelid_R",
+        "Brow0_L", "Brow0_R",
+        "Brow1_L", "Brow1_R",
+        "CheekBone_L", "CheekBone_R",
+        "LipCorner_L", "LipCorner_R"
+    };
+    return $bones;
+}
+
+// ---------------------------------------------------------------------------
+// The full facial bone set for THIS character = core 18 + any per-character
+// extras registered with AddFacialBone (ears, whiskers, jowls...). Extras are
+// stored on the FacePoseLib node, so they travel with the scene and the
+// .flib. Poses may pose extras freely — the pose NAMES are the universal
+// contract across characters; the BONES inside each pose are per-character.
+// ---------------------------------------------------------------------------
+global proc string[] FacePoseBones()
+{
+    string $bones[] = CoreFaceBones();
+    if (`objExists "FacePoseLib"` && `attributeExists "extraBones" "FacePoseLib"`)
+    {
+        string $extra = `getAttr "FacePoseLib.extraBones"`;
+        string $tok[];
+        tokenize($extra, " ", $tok);
+        for ($t in $tok)
+        {
+            if ($t != "")
+                $bones[size($bones)] = $t;
+        }
+    }
+    return $bones;
+}
+
+// ---------------------------------------------------------------------------
+// Register a per-character extra facial bone (e.g. AddFacialBone("Ear_L")).
+// RUN BEFORE SaveNeutral / capturing — Neutral must include the bone or its
+// deltas can't be computed. Extras are exempt from the audit's cross-side
+// check (deliberately posing both ears in a one-sided pose is normal).
+// ---------------------------------------------------------------------------
+global proc AddFacialBone(string $bone)
+{
+    if (!`objExists $bone`)
+        warning("AddFacialBone: '" + $bone + "' doesn't exist in this scene (registered anyway — make sure the name is right).");
+
+    string $core[] = CoreFaceBones();
+    for ($c in $core)
+        if ($c == $bone)
+            error("AddFacialBone: '" + $bone + "' is already a core facial bone.");
+
+    string $lib = EnsureFacePoseLib();
+    if (!`attributeExists "extraBones" $lib`)
+    {
+        addAttr -longName "extraBones" -dataType "string" $lib;
+        setAttr -type "string" ($lib + ".extraBones") "";
+    }
+    string $cur = `getAttr ($lib + ".extraBones")`;
+    string $tok[];
+    tokenize($cur, " ", $tok);
+    for ($t in $tok)
+        if ($t == $bone)
+        {
+            warning("AddFacialBone: '" + $bone + "' is already registered.");
+            return;
+        }
+
+    string $newVal = strip($cur + " " + $bone);
+    setAttr -type "string" ($lib + ".extraBones") $newVal;
+    print("AddFacialBone: '" + $bone + "' registered for this character.\n");
+    print("IMPORTANT: run SaveNeutral() (face at rest) again so Neutral includes it,\n");
+    print("BEFORE capturing any pose that uses it.\n");
+}
+
+global proc RemoveFacialBone(string $bone)
+{
+    if (!`objExists "FacePoseLib"` || !`attributeExists "extraBones" "FacePoseLib"`)
+    {
+        warning "RemoveFacialBone: no extra bones registered.";
+        return;
+    }
+    string $cur = `getAttr "FacePoseLib.extraBones"`;
+    string $tok[];
+    tokenize($cur, " ", $tok);
+    string $out = "";
+    int $found = 0;
+    for ($t in $tok)
+    {
+        if ($t == $bone) { $found = 1; continue; }
+        if ($t != "") $out += $t + " ";
+    }
+    if (!$found)
+    {
+        warning("RemoveFacialBone: '" + $bone + "' was not registered.");
+        return;
+    }
+    setAttr -type "string" "FacePoseLib.extraBones" `strip $out`;
+    print("RemoveFacialBone: '" + $bone + "' unregistered (existing pose data for it is untouched — use RemoveBoneFromPoses to strip it from poses).\n");
+}
+
+global proc ListFacialBones()
+{
+    string $core[] = CoreFaceBones();
+    print("\nCore facial bones (" + size($core) + "): " + stringArrayToString($core, ", ") + "\n");
+    string $all[] = FacePoseBones();
+    if (size($all) > size($core))
+    {
+        string $extras[];
+        for ($i = size($core); $i < size($all); $i++)
+            $extras[size($extras)] = $all[$i];
+        print("This character's extras (" + size($extras) + "): " + stringArrayToString($extras, ", ") + "\n\n");
+    }
+    else
+        print("No per-character extras registered (AddFacialBone to add).\n\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// The canonical 29-pose list. A pose's NUMBER is its position here (1-based);
+// 0 is Neutral. Same numbers double as frame numbers in the timeline route.
+// ---------------------------------------------------------------------------
+global proc string[] FacePoseNames()
+{
+    string $poses[] = {
+        // Mouth (11)
+        "JawOpen",
+        "Smile_L", "Smile_R",
+        "Frown_L", "Frown_R",
+        "MouthWide_L", "MouthWide_R",
+        "MouthNarrow_L", "MouthNarrow_R",
+        "UpperLipRaise",
+        "LowerLipDown",
+        // Brows (6)
+        "BrowUp_L", "BrowUp_R",
+        "BrowSad_L", "BrowSad_R",
+        "BrowAngry_L", "BrowAngry_R",
+        // Eyes (10)
+        "Blink_L", "Blink_R",
+        "EyeWide_L", "EyeWide_R",
+        "Squint_L", "Squint_R",
+        "EyesUp", "EyesDown", "EyesLeft", "EyesRight",
+        // Cheeks (2)
+        "CheekRaise_L", "CheekRaise_R"
+    };
+    return $poses;
+}
+
+
+// ---------------------------------------------------------------------------
+// Print the number <-> pose table.
+// ---------------------------------------------------------------------------
+global proc PoseTable()
+{
+    string $poses[] = FacePoseNames();
+    print("\n===== Face Pose Table (number = CapturePose arg = frame) =====\n");
+    print("  0\tNeutral (face at rest — captured via SaveNeutral)\n");
+    for ($i = 0; $i < size($poses); $i++)
+    {
+        print("  " + ($i + 1) + "\t" + $poses[$i] + "\n");
+    }
+    print("===============================================================\n\n");
+}
+
+// Old name kept so existing docs/habits still work.
+global proc PrintPoseFrameMap(int $startFrame)
+{
+    if ($startFrame != 0)
+        print("(Note: pose numbers below assume a start frame of 0; add "
+              + $startFrame + " for your frames.)\n");
+    PoseTable();
+}
+
+
+// ---------------------------------------------------------------------------
+// In-scene storage: one node per pose under a FacePoseLib group, with a
+// string attribute "poseData". One line per bone:
+//   boneName tx ty tz rx ry rz
+// Neutral stores ABSOLUTE local values; poses store DELTAS from Neutral.
+// ---------------------------------------------------------------------------
+global proc string EnsureFacePoseLib()
+{
+    if (!`objExists "FacePoseLib"`)
+    {
+        group -em -name "FacePoseLib";
+    }
+    return "FacePoseLib";
+}
+
+global proc string FacePoseNodeName(string $poseName)
+{
+    return ("FPose_" + $poseName);
+}
+
+global proc StoreFacePoseData(string $poseName, string $data)
+{
+    string $lib = EnsureFacePoseLib();
+    string $node = FacePoseNodeName($poseName);
+    if (!`objExists $node`)
+    {
+        createNode "transform" -name $node -parent $lib;
+    }
+    if (!`attributeExists "poseData" $node`)
+    {
+        addAttr -longName "poseData" -dataType "string" $node;
+    }
+    setAttr -type "string" ($node + ".poseData") $data;
+}
+
+global proc string LoadFacePoseData(string $poseName)
+{
+    string $node = FacePoseNodeName($poseName);
+    if (!`objExists $node`) return "";
+    if (!`attributeExists "poseData" $node`) return "";
+    string $data = `getAttr ($node + ".poseData")`;
+    return $data;
+}
+
+
+// ---------------------------------------------------------------------------
+// Resolve a bone's short name to a UNIQUE full DAG path. If more than one
+// object in the scene shares that name, getAttr/setAttr on the short name
+// silently returns/affects ALL of them (getAttr returns a float[] instead of
+// a float — the "Cannot convert data of type float[] to type float" error).
+// This fails loudly instead, naming every duplicate, so it gets fixed rather
+// than silently corrupting a capture.
+// ---------------------------------------------------------------------------
+global proc string ResolveFaceBone(string $bone)
+{
+    string $matches[] = `ls -long $bone`;
+    if (size($matches) == 0)
+    {
+        error("ResolveFaceBone: '" + $bone + "' does not exist in this scene.");
+    }
+    if (size($matches) > 1)
+    {
+        string $list = stringArrayToString($matches, "\n  ");
+        error("ResolveFaceBone: '" + $bone + "' is NOT UNIQUE — "
+              + size($matches) + " objects share this name:\n  " + $list
+              + "\nRename one in the Outliner so facial bone names are unique, then retry.");
+    }
+    return $matches[0];
+}
+
+
+// ---------------------------------------------------------------------------
+// Read a bone's local translate + rotate as float[6].
+// ---------------------------------------------------------------------------
+global proc float[] ReadBoneTR(string $bone)
+{
+    string $full = ResolveFaceBone($bone);
+    float $v[6];
+    $v[0] = `getAttr ($full + ".translateX")`;
+    $v[1] = `getAttr ($full + ".translateY")`;
+    $v[2] = `getAttr ($full + ".translateZ")`;
+    $v[3] = `getAttr ($full + ".rotateX")`;
+    $v[4] = `getAttr ($full + ".rotateY")`;
+    $v[5] = `getAttr ($full + ".rotateZ")`;
+    return $v;
+}
+
+
+// ---------------------------------------------------------------------------
+// Look up a bone's stored Neutral values. Empty array if not found.
+// ---------------------------------------------------------------------------
+global proc float[] FaceNeutralFor(string $bone)
+{
+    float $empty[];
+    string $data = LoadFacePoseData("Neutral");
+    if ($data == "")
+    {
+        error "No Neutral saved. Put the face at rest and run SaveNeutral() first.";
+    }
+
+    string $lines[];
+    tokenize($data, "\n", $lines);
+    for ($line in $lines)
+    {
+        string $tok[];
+        int $n = tokenize($line, " ", $tok);
+        if ($n == 7 && $tok[0] == $bone)
+        {
+            float $v[6];
+            for ($i = 0; $i < 6; $i++)
+            {
+                $v[$i] = (float) $tok[$i + 1];
+            }
+            return $v;
+        }
+    }
+    return $empty;
+}
+
+
+// ---------------------------------------------------------------------------
+// Capture Neutral from the CURRENT face (run with the face fully at rest).
+// ---------------------------------------------------------------------------
+global proc SaveNeutral()
+{
+    string $bones[] = FacePoseBones();
+    string $data = "";
+    int $count = 0;
+
+    for ($b in $bones)
+    {
+        if (!`objExists $b`)
+        {
+            warning("SaveNeutral: bone not found, skipped: " + $b);
+            continue;
+        }
+        float $v[] = ReadBoneTR($b);
+        $data += $b + " " + $v[0] + " " + $v[1] + " " + $v[2]
+                    + " " + $v[3] + " " + $v[4] + " " + $v[5] + "\n";
+        $count++;
+    }
+
+    if ($count == 0)
+    {
+        warning "SaveNeutral: NO facial bones found in this scene — nothing saved.";
+        return;
+    }
+
+    StoreFacePoseData("Neutral", $data);
+    print("SaveNeutral: captured " + $count + " facial bones.\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// Capture the CURRENT face as pose $poseName (deltas vs Neutral).
+// Membership = any bone whose delta exceeds epsilon.
+// A capture that finds NOTHING moved is NOT saved — loud warning instead,
+// and any previously captured data for that pose is left untouched.
+// ---------------------------------------------------------------------------
+global proc CapturePoseCurrent(string $poseName)
+{
+    float $tEps = 0.0005;   // translate epsilon (scene units)
+    float $rEps = 0.01;     // rotate epsilon (degrees)
+
+    string $bones[] = FacePoseBones();
+    string $data = "";
+    string $involved[];
+
+    for ($b in $bones)
+    {
+        if (!`objExists $b`) continue;
+
+        float $n[] = FaceNeutralFor($b);
+        if (size($n) == 0) continue;
+
+        float $c[] = ReadBoneTR($b);
+        float $d[6];
+        int $moved = 0;
+        for ($i = 0; $i < 6; $i++)
+        {
+            $d[$i] = $c[$i] - $n[$i];
+            float $eps = ($i < 3) ? $tEps : $rEps;
+            if (abs($d[$i]) > $eps)
+                $moved = 1;
+            else
+                $d[$i] = 0.0;
+        }
+
+        if ($moved)
+        {
+            $data += $b + " " + $d[0] + " " + $d[1] + " " + $d[2]
+                        + " " + $d[3] + " " + $d[4] + " " + $d[5] + "\n";
+            $involved[size($involved)] = $b;
+        }
+    }
+
+    if (size($involved) == 0)
+    {
+        warning("CapturePose(" + $poseName + "): the face is identical to Neutral"
+                + " — NOTHING SAVED. Sculpt the pose first, then capture.");
+        return;
+    }
+
+    StoreFacePoseData($poseName, $data);
+
+    string $list = stringArrayToString($involved, ", ");
+    print("Captured " + $poseName + "  [" + size($involved) + " bones: " + $list + "]\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// THE main capture call. Sculpt the face, then capture it by NUMBER from
+// PoseTable. No keyframes, no timeline — reads the face as it sits.
+//   CapturePose(0);   // recapture Neutral (face must be at rest)
+//   CapturePose(2);   // capture current face as Smile_L
+// ---------------------------------------------------------------------------
+global proc CapturePose(int $poseNumber)
+{
+    if ($poseNumber == 0)
+    {
+        SaveNeutral();
+        return;
+    }
+
+    string $poses[] = FacePoseNames();
+    int $idx = $poseNumber - 1;
+    if ($idx < 0 || $idx >= size($poses))
+    {
+        error("CapturePose: number " + $poseNumber + " is outside the table (0-"
+              + size($poses) + "). Run PoseTable();");
+    }
+
+    CapturePoseCurrent($poses[$idx]);
+}
+
+
+// ---------------------------------------------------------------------------
+// TIMELINE ROUTE (optional). Poses keyed on frames 0-29 per PoseTable.
+// ---------------------------------------------------------------------------
+global proc CaptureAllPoseFrames(int $startFrame)
+{
+    currentTime $startFrame;
+    SaveNeutral();
+
+    string $poses[] = FacePoseNames();
+    string $emptyPoses[];
+    int $captured = 0;
+
+    for ($i = 0; $i < size($poses); $i++)
+    {
+        currentTime ($startFrame + 1 + $i);
+        CapturePoseCurrent($poses[$i]);
+        if (LoadFacePoseData($poses[$i]) == "")
+            $emptyPoses[size($emptyPoses)] = $poses[$i];
+        else
+            $captured++;
+    }
+
+    print("\nCaptureAllPoseFrames: " + $captured + " of " + size($poses) + " poses captured.\n");
+    if (size($emptyPoses) > 0)
+    {
+        warning("CaptureAllPoseFrames: " + size($emptyPoses) + " poses came back EMPTY"
+                + " and were NOT saved — the library is NOT complete:");
+        print("  MISSING: " + stringArrayToString($emptyPoses, ", ") + "\n");
+        print("  Sculpt each missing pose and run CapturePose(number); — see PoseTable();\n\n");
+    }
+    else
+    {
+        print("Library complete. SAVE IT: ExportFaceFiles(); (or SaveLibraryFile)\n\n");
+    }
+
+    AuditPoseLibrary();
+}
+
+// ---------------------------------------------------------------------------
+// ONE-SWOOP bulk finish: capture every frame, audit, create the FacePoses
+// node if it's missing, and pop the save dialog for .flib + .json — the
+// whole finish line in one command. Use CaptureAllPoseFrames() alone when
+// you only want the capture.
+// ---------------------------------------------------------------------------
+global proc CaptureAllAndExport(int $startFrame)
+{
+    CaptureAllPoseFrames($startFrame);   // includes the audit
+    CreateFacePosesNode();               // idempotent — creates only if missing
+    ExportFaceFiles();                   // save dialog: <Name>.flib + <Name>.json
+}
+
+// Recapture one pose from its frame in the timeline route.
+global proc CapturePoseFrame(int $frame)
+{
+    if ($frame == 0)
+    {
+        currentTime 0;
+        SaveNeutral();
+        return;
+    }
+    string $poses[] = FacePoseNames();
+    int $idx = $frame - 1;
+    if ($idx < 0 || $idx >= size($poses))
+    {
+        error("CapturePoseFrame: frame " + $frame + " is outside the pose map (0-"
+              + size($poses) + "). Run PoseTable();");
+    }
+    currentTime $frame;
+    CapturePoseCurrent($poses[$idx]);
+}
+
+// Capture the pose mapped to whatever frame you're parked on (timeline route).
+global proc CaptureCurrentFrame()
+{
+    int $frame = (int) `currentTime -q`;
+    CapturePoseFrame($frame);
+}
+
+
+// ---------------------------------------------------------------------------
+// Preview a captured pose by NUMBER at a weight (bone = neutral + w * delta).
+// Constrained/locked channels are skipped with a warning — preview on a bare
+// skeleton for clean results. PreviewPose(0, ...) = ResetFace.
+// ---------------------------------------------------------------------------
+global proc PreviewPose(int $poseNumber, float $weight)
+{
+    if ($poseNumber == 0)
+    {
+        ResetFace();
+        return;
+    }
+    string $poses[] = FacePoseNames();
+    int $idx = $poseNumber - 1;
+    if ($idx < 0 || $idx >= size($poses))
+    {
+        error("PreviewPose: number " + $poseNumber + " is outside the table (0-"
+              + size($poses) + "). Run PoseTable();");
+    }
+    ApplyPose($poses[$idx], $weight);
+}
+
+global proc ApplyPose(string $poseName, float $weight)
+{
+    string $data = LoadFacePoseData($poseName);
+    if ($data == "")
+    {
+        error("ApplyPose: no captured data for pose '" + $poseName + "'. Run LibraryStatus();");
+    }
+
+    string $channels[] = { "translateX", "translateY", "translateZ",
+                           "rotateX", "rotateY", "rotateZ" };
+    string $skipped[];
+
+    string $lines[];
+    tokenize($data, "\n", $lines);
+    for ($line in $lines)
+    {
+        string $tok[];
+        int $n = tokenize($line, " ", $tok);
+        if ($n != 7) continue;
+
+        string $bone = $tok[0];
+        if (!`objExists $bone`) continue;
+        string $full = ResolveFaceBone($bone);
+
+        float $neutral[] = FaceNeutralFor($bone);
+        if (size($neutral) == 0) continue;
+
+        for ($i = 0; $i < 6; $i++)
+        {
+            float $delta = (float) $tok[$i + 1];
+            float $target = $neutral[$i] + ($weight * $delta);
+            string $attr = $full + "." + $channels[$i];
+            if (`getAttr -settable $attr`)
+                setAttr $attr $target;
+            else
+                $skipped[size($skipped)] = $attr;
+        }
+    }
+
+    if (size($skipped) > 0)
+    {
+        warning("ApplyPose: " + size($skipped) + " channels skipped (constrained/locked). Preview on a bare skeleton for clean results.");
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Return every facial bone to its stored Neutral (bare skeleton).
+// On a rigged character, reset via your controls / Studio Library instead.
+// ---------------------------------------------------------------------------
+global proc ResetFace()
+{
+    string $channels[] = { "translateX", "translateY", "translateZ",
+                           "rotateX", "rotateY", "rotateZ" };
+    string $bones[] = FacePoseBones();
+    int $skippedCount = 0;
+
+    for ($b in $bones)
+    {
+        if (!`objExists $b`) continue;
+        string $full = ResolveFaceBone($b);
+        float $neutral[] = FaceNeutralFor($b);
+        if (size($neutral) == 0) continue;
+
+        for ($i = 0; $i < 6; $i++)
+        {
+            string $attr = $full + "." + $channels[$i];
+            if (`getAttr -settable $attr`)
+                setAttr $attr $neutral[$i];
+            else
+                $skippedCount++;
+        }
+    }
+
+    if ($skippedCount > 0)
+    {
+        warning("ResetFace: " + $skippedCount + " channels skipped (constrained/locked — reset those via your rig controls).");
+    }
+    print("ResetFace: done.\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// MIRROR a captured pose, in either direction.
+//
+//   MirrorPoseLeftToRight(2);   // Smile_L -> Smile_R   (either number of a pair works)
+//   MirrorPoseRightToLeft(2);   // Smile_R -> Smile_L
+//   MirrorPoseLeftToRight(1);   // center pose (JawOpen): rebuild its R side from its L side
+//   MirrorPose(2);              // same as before: mirrors FROM the side of the pose you pick
+//   MirrorReport();             // how every L/R bone pair maps + neutral symmetry check
+//
+// RUN WITH THE FACE AT NEUTRAL. The mirror measures each bone pair's real
+// frames from the scene (translate: parent frames, rotate: joint frames,
+// reflected across world X), so it works whatever the rig's L/R convention.
+// It replaces the old fixed flip mask (negate tx, ry, rz), which was wrong
+// for this skeleton: the captured library shows the eyelids and eyes flip
+// ALL translations and keep rotations, and LipCorner keeps ry.
+// Data is written straight to the pose node, so it works on a rigged face.
+// VERIFY the first one: MirrorPoseLeftToRight(18); (Blink) should reproduce
+// the hand-captured Blink_R.
+// ---------------------------------------------------------------------------
+
+// Side-token rules, checked in order. Flat list, three entries per rule:
+//   leftToken  rightToken  placement ("suffix", "prefix" or "any")
+// Add a row here when a new rig names its sides differently.
+global proc string[] FaceSideRules()
+{
+    string $r[] = {
+        "_L",   "_R",    "suffix",
+        "_l",   "_r",    "suffix",
+        "L_",   "R_",    "prefix",
+        "l_",   "r_",    "prefix",
+        "Left", "Right", "any",
+        "left", "right", "any"
+    };
+    return $r;
+}
+
+global proc int FaceHasToken(string $name, string $tok, string $where)
+{
+    int $n = size($name);
+    int $t = size($tok);
+    if ($t == 0 || $n <= $t) return 0;          // the token alone is not a name
+    if ($where == "suffix") return (substring($name, $n - $t + 1, $n) == $tok);
+    if ($where == "prefix") return (substring($name, 1, $t) == $tok);
+    return `gmatch $name ("*" + $tok + "*")`;
+}
+
+global proc string FaceReplaceToken(string $name, string $from, string $to, string $where)
+{
+    int $n = size($name);
+    int $t = size($from);
+    if ($where == "suffix") return (substring($name, 1, $n - $t) + $to);
+    if ($where == "prefix") return ($to + substring($name, $t + 1, $n));
+    return `substitute $from $name $to`;
+}
+
+// "L", "R", or "" for center names.
+global proc string FaceSideOf(string $name)
+{
+    string $r[] = FaceSideRules();
+    for ($i = 0; $i < size($r); $i += 3)
+    {
+        if (FaceHasToken($name, $r[$i], $r[$i + 2]))     return "L";
+        if (FaceHasToken($name, $r[$i + 1], $r[$i + 2])) return "R";
+    }
+    return "";
+}
+
+// Opposite-side name, or the name unchanged if it is a center name.
+global proc string FaceSwapSide(string $name)
+{
+    string $r[] = FaceSideRules();
+    for ($i = 0; $i < size($r); $i += 3)
+    {
+        string $a = $r[$i];
+        string $b = $r[$i + 1];
+        string $w = $r[$i + 2];
+        if (FaceHasToken($name, $a, $w)) return FaceReplaceToken($name, $a, $b, $w);
+        if (FaceHasToken($name, $b, $w)) return FaceReplaceToken($name, $b, $a, $w);
+    }
+    return $name;
+}
+
+// Old name kept so existing calls still work.
+global proc string MirrorFaceBoneName(string $bone)
+{
+    return FaceSwapSide($bone);
+}
+
+// Three unit axis rows (x, y, z) of a node's world matrix, 9 floats.
+// $ofParent = 1 measures the node's PARENT (the frame translate lives in);
+// a node with no parent returns world axes.
+global proc float[] FaceAxisRows(string $fullPath, int $ofParent)
+{
+    float $rows[] = { 1.0, 0.0, 0.0,   0.0, 1.0, 0.0,   0.0, 0.0, 1.0 };
+    string $node = $fullPath;
+    if ($ofParent)
+    {
+        string $p[] = `listRelatives -parent -fullPath $fullPath`;
+        if (size($p) == 0) return $rows;
+        $node = $p[0];
+    }
+    float $m[] = `xform -q -worldSpace -matrix $node`;
+    for ($i = 0; $i < 3; $i++)
+    {
+        float $x = $m[$i * 4];
+        float $y = $m[$i * 4 + 1];
+        float $z = $m[$i * 4 + 2];
+        float $len = sqrt($x * $x + $y * $y + $z * $z);
+        if ($len < 0.000000001) $len = 1.0;
+        $rows[$i * 3]     = $x / $len;
+        $rows[$i * 3 + 1] = $y / $len;
+        $rows[$i * 3 + 2] = $z / $len;
+    }
+    return $rows;
+}
+
+// Mirror map C (9 floats, row-major): target channel j receives
+//   sum over i of  source channel i * C[i*3 + j]
+// Reflection plane = world YZ (world X flips). Rotations are pseudovectors,
+// so a reflection also reverses their sense (the -1 for $isRotation).
+global proc float[] FaceMirrorMap(float $src[], float $dst[], int $isRotation)
+{
+    float $c[9];
+    float $s = 1.0;
+    if ($isRotation) $s = -1.0;
+    for ($i = 0; $i < 3; $i++)
+    {
+        for ($j = 0; $j < 3; $j++)
+        {
+            float $d = - $src[$i * 3]     * $dst[$j * 3]
+                       + $src[$i * 3 + 1] * $dst[$j * 3 + 1]
+                       + $src[$i * 3 + 2] * $dst[$j * 3 + 2];
+            $d = $d * $s;
+            if (abs($d) < 0.0001) $d = 0.0;
+            $c[$i * 3 + $j] = $d;
+        }
+    }
+    return $c;
+}
+
+// 1 if every source axis lands cleanly on one target axis (the normal case
+// for a symmetric rig); 0 if the frames are oblique and the mapping blends
+// channels (still applied, but rotations become an approximation).
+global proc int FaceMapIsClean(float $c[])
+{
+    for ($i = 0; $i < 3; $i++)
+    {
+        int $hits = 0;
+        for ($j = 0; $j < 3; $j++)
+            if (abs($c[$i * 3 + $j]) > 0.99) $hits++;
+        if ($hits != 1) return 0;
+    }
+    return 1;
+}
+
+// Human-readable summary of a map, e.g. "tx>-tx ty>+ty tz>+tz"
+global proc string FaceMapLabel(float $c[], string $prefix)
+{
+    string $axes[] = { "x", "y", "z" };
+    string $out = "";
+    for ($i = 0; $i < 3; $i++)
+    {
+        int $best = 0;
+        for ($j = 1; $j < 3; $j++)
+            if (abs($c[$i * 3 + $j]) > abs($c[$i * 3 + $best])) $best = $j;
+        float $v = $c[$i * 3 + $best];
+        string $sign = "+";
+        if ($v < 0) $sign = "-";
+        if (abs($v) < 0.99) $sign = "~";
+        $out += $prefix + $axes[$i] + ">" + $sign + $prefix + $axes[$best] + " ";
+    }
+    return $out;
+}
+
+// Mirror one bone's 6 channel values (tx ty tz rx ry rz) from $srcBone to $dstBone.
+// Returns 7 floats: 6 mirrored values + a clean flag (1/0) in slot 6.
+global proc float[] FaceMirrorChannels(string $srcBone, string $dstBone, float $v[])
+{
+    string $srcFull = ResolveFaceBone($srcBone);
+    string $dstFull = ResolveFaceBone($dstBone);
+
+    float $sp[] = FaceAxisRows($srcFull, 1);
+    float $dp[] = FaceAxisRows($dstFull, 1);
+    float $sj[] = FaceAxisRows($srcFull, 0);
+    float $dj[] = FaceAxisRows($dstFull, 0);
+    float $tMap[] = FaceMirrorMap($sp, $dp, 0);
+    float $rMap[] = FaceMirrorMap($sj, $dj, 1);
+
+    float $out[7];
+    for ($j = 0; $j < 3; $j++)
+    {
+        $out[$j]     = $v[0] * $tMap[$j] + $v[1] * $tMap[3 + $j] + $v[2] * $tMap[6 + $j];
+        $out[$j + 3] = $v[3] * $rMap[$j] + $v[4] * $rMap[3 + $j] + $v[5] * $rMap[6 + $j];
+    }
+    $out[6] = 0.0;
+    if (FaceMapIsClean($tMap) && FaceMapIsClean($rMap)) $out[6] = 1.0;
+    return $out;
+}
+
+// How many facial bones are currently off their stored neutral.
+global proc int FaceOffNeutralCount()
+{
+    string $chan[] = { "translateX", "translateY", "translateZ",
+                       "rotateX", "rotateY", "rotateZ" };
+    string $bones[] = FacePoseBones();
+    int $off = 0;
+    for ($b in $bones)
+    {
+        if (!`objExists $b`) continue;
+        string $full = ResolveFaceBone($b);
+        float $n[] = FaceNeutralFor($b);
+        if (size($n) == 0) continue;
+        for ($c = 0; $c < 6; $c++)
+        {
+            float $cur = `getAttr ($full + "." + $chan[$c])`;
+            if (abs($cur - $n[$c]) > 0.01) { $off++; break; }
+        }
+    }
+    return $off;
+}
+
+// Which pose is read and which is written for pose #N in a direction.
+// Returns { source, target }. Center poses return themselves twice
+// (that means "symmetrize in place"). Returns an empty array when there is
+// no valid pair (FaceMirrorPair is the version that raises an error).
+global proc string[] FaceMirrorPairQuiet(int $n, string $fromSide)
+{
+    string $none[];
+    string $poses[] = FacePoseNames();
+    if ($n < 1 || $n > size($poses)) return $none;
+
+    string $picked = $poses[$n - 1];
+    string $side = FaceSideOf($picked);
+    string $src = $picked;
+    if ($side != "" && $side != $fromSide)
+        $src = FaceSwapSide($picked);
+    string $dst = FaceSwapSide($src);
+
+    if (!stringArrayContains($src, $poses) || !stringArrayContains($dst, $poses))
+        return $none;
+
+    string $pair[] = { $src, $dst };
+    return $pair;
+}
+
+global proc string[] FaceMirrorPair(int $n, string $fromSide)
+{
+    string $pair[] = FaceMirrorPairQuiet($n, $fromSide);
+    if (size($pair) == 2) return $pair;
+
+    string $poses[] = FacePoseNames();
+    if ($n < 1 || $n > size($poses))
+        error("Mirror: pose number must be 1-" + size($poses) + " (0 is Neutral, which isn't mirrored). Run PoseTable();");
+    error("Mirror: '" + $poses[$n - 1] + "' has no partner pose in the pose list.");
+    return $pair;
+}
+
+// Core. $fromSide is "L" or "R". Returns the name of the pose written.
+global proc string MirrorFacePose(int $n, string $fromSide)
+{
+    if ($fromSide != "L" && $fromSide != "R")
+        error "MirrorFacePose: side must be \"L\" or \"R\".";
+    string $toSide = "R";
+    if ($fromSide == "R") $toSide = "L";
+
+    string $pair[] = FaceMirrorPair($n, $fromSide);
+    string $src = $pair[0];
+    string $dst = $pair[1];
+    int $symmetrize = ($src == $dst);
+
+    if (LoadFacePoseData("Neutral") == "")
+        error "Mirror: no Neutral saved. SaveNeutral(); first.";
+    string $data = LoadFacePoseData($src);
+    if ($data == "")
+        error("Mirror: '" + $src + "' hasn't been captured yet. Capture it, then mirror. Run LibraryStatus();");
+
+    int $off = FaceOffNeutralCount();
+    if ($off > 0)
+        warning("Mirror: " + $off + " facial bones are not at neutral. Bone frames are measured from the scene, so put the face at rest for an exact mirror.");
+
+    string $out = "";
+    string $involved[];
+    int $oblique = 0;
+
+    string $lines[];
+    tokenize($data, "\n", $lines);
+    for ($line in $lines)
+    {
+        string $tok[];
+        int $k = tokenize($line, " ", $tok);
+        if ($k != 7) continue;
+
+        string $bone  = $tok[0];
+        string $bSide = FaceSideOf($bone);
+
+        if ($symmetrize)
+        {
+            if ($bSide == $toSide) continue;   // rebuilt from its partner below
+            $out += strip($line) + "\n";       // from-side and center bones stay as captured
+            $involved[size($involved)] = $bone;
+            if ($bSide == "") continue;
+        }
+
+        string $target = FaceSwapSide($bone);  // center bones map onto themselves
+        if (!`objExists $bone` || !`objExists $target`)
+        {
+            warning("Mirror: '" + $bone + "' -> '" + $target + "' missing in this scene, skipped.");
+            continue;
+        }
+
+        float $v[6];
+        for ($c = 0; $c < 6; $c++)
+            $v[$c] = (float) $tok[$c + 1];
+        float $m[] = FaceMirrorChannels($bone, $target, $v);
+
+        string $newLine = $target;
+        int $moves = 0;
+        for ($c = 0; $c < 6; $c++)
+        {
+            float $x = $m[$c];
+            if (abs($x) < 0.0000001) $x = 0.0;
+            else $moves = 1;
+            $newLine += " " + $x;
+        }
+        if (!$moves) continue;
+
+        $out += $newLine + "\n";
+        string $label = $target;
+        if ($m[6] < 0.5)
+        {
+            $label += " (oblique)";
+            $oblique++;
+        }
+        $involved[size($involved)] = $label;
+    }
+
+    if ($out == "")
+        error("Mirror: nothing to write for '" + $dst + "' (source had no bones on the mirrored side).");
+
+    StoreFacePoseData($dst, $out);
+
+    if ($symmetrize)
+        print("Mirror: symmetrized " + $dst + " (" + $fromSide + " side -> " + $toSide + " side)"
+              + "  [" + size($involved) + " bones: " + stringArrayToString($involved, ", ") + "]\n");
+    else
+        print("Mirror: " + $src + " -> " + $dst
+              + "  [" + size($involved) + " bones: " + stringArrayToString($involved, ", ") + "]\n");
+    if ($oblique > 0)
+        warning("Mirror: " + $oblique + " bone(s) had oblique frames (approximate). Run MirrorReport(); and check that pose by eye.");
+    return $dst;
+}
+
+global proc MirrorPoseLeftToRight(int $poseNumber)
+{
+    MirrorFacePose($poseNumber, "L");
+}
+
+global proc MirrorPoseRightToLeft(int $poseNumber)
+{
+    MirrorFacePose($poseNumber, "R");
+}
+
+// Original command, same meaning as before: mirrors FROM the side of the
+// pose you pick (MirrorPose(2) = Smile_L -> Smile_R, MirrorPose(3) = Smile_R
+// -> Smile_L). Center poses need a direction, so they point you to the two
+// commands above.
+global proc MirrorPose(int $poseNumber)
+{
+    string $poses[] = FacePoseNames();
+    int $idx = $poseNumber - 1;
+    if ($idx < 0 || $idx >= size($poses))
+    {
+        error("MirrorPose: number " + $poseNumber + " is outside the table (1-"
+              + size($poses) + "). Run PoseTable();");
+    }
+    string $side = FaceSideOf($poses[$idx]);
+    if ($side == "")
+        error("MirrorPose: '" + $poses[$idx] + "' is a center pose. Pick a direction: MirrorPoseLeftToRight("
+              + $poseNumber + "); or MirrorPoseRightToLeft(" + $poseNumber + ");");
+    MirrorFacePose($poseNumber, $side);
+}
+
+// Every facial bone and the mirror map it would use, plus a check that the
+// stored neutral is itself symmetric. Center bones are listed against themselves.
+global proc MirrorReport()
+{
+    if (LoadFacePoseData("Neutral") == "")
+        error "MirrorReport: no Neutral saved. SaveNeutral(); first.";
+
+    string $bones[] = FacePoseBones();
+    print("\n================ MirrorReport (world X mirror) ================\n");
+    for ($b in $bones)
+    {
+        if (FaceSideOf($b) == "R") continue;       // each pair listed once, from its L bone
+        string $t = FaceSwapSide($b);
+        if (!`objExists $b` || !`objExists $t`)
+        {
+            print("  " + $b + " -> " + $t + "   MISSING in scene\n");
+            continue;
+        }
+        string $srcFull = ResolveFaceBone($b);
+        string $dstFull = ResolveFaceBone($t);
+        float $sp[] = FaceAxisRows($srcFull, 1);
+        float $dp[] = FaceAxisRows($dstFull, 1);
+        float $sj[] = FaceAxisRows($srcFull, 0);
+        float $dj[] = FaceAxisRows($dstFull, 0);
+        float $tMap[] = FaceMirrorMap($sp, $dp, 0);
+        float $rMap[] = FaceMirrorMap($sj, $dj, 1);
+
+        string $line = "  " + $b + " -> " + $t + "   " + FaceMapLabel($tMap, "t") + "| " + FaceMapLabel($rMap, "r");
+        if (!FaceMapIsClean($tMap) || !FaceMapIsClean($rMap))
+            $line += "  OBLIQUE";
+
+        // neutral symmetry: translations only (positions mirror exactly)
+        float $ns[] = FaceNeutralFor($b);
+        float $nd[] = FaceNeutralFor($t);
+        if (size($ns) == 6 && size($nd) == 6)
+        {
+            float $err = 0.0;
+            for ($j = 0; $j < 3; $j++)
+            {
+                float $mj = $ns[0] * $tMap[$j] + $ns[1] * $tMap[3 + $j] + $ns[2] * $tMap[6 + $j];
+                $err = max($err, abs($mj - $nd[$j]));
+            }
+            if ($err > 0.01)
+                $line += "  neutral asymmetric by " + $err;
+        }
+        print($line + "\n");
+    }
+    print("t = translate (parent frame), r = rotate (joint frame). '-' flips, '+' keeps,\n");
+    print("'~' means the axes don't line up (OBLIQUE). 'neutral asymmetric' is real model\n");
+    print("asymmetry, not an error; mirrored poses stay relative to each side's own neutral.\n");
+    print("================================================================\n\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// Which poses are captured, which are MISSING. Run this before exporting,
+// and any time you're unsure whether the library in this scene is real.
+// ---------------------------------------------------------------------------
+global proc LibraryStatus()
+{
+    print("\n===== Face Pose Library Status (this scene) =====\n");
+
+    string $neutral = LoadFacePoseData("Neutral");
+    if ($neutral == "")
+        print("  0\tNeutral\t\tMISSING  <- SaveNeutral() with the face at rest\n");
+    else
+        print("  0\tNeutral\t\tok\n");
+
+    string $poses[] = FacePoseNames();
+    int $captured = 0;
+    string $missing[];
+    for ($i = 0; $i < size($poses); $i++)
+    {
+        string $d = LoadFacePoseData($poses[$i]);
+        string $lines[];
+        int $bones = 0;
+        if ($d != "")
+        {
+            tokenize($d, "\n", $lines);
+            $bones = size($lines);
+        }
+        if ($bones > 0)
+        {
+            print("  " + ($i + 1) + "\t" + $poses[$i] + "\t\tok (" + $bones + " bones)\n");
+            $captured++;
+        }
+        else
+        {
+            print("  " + ($i + 1) + "\t" + $poses[$i] + "\t\tMISSING\n");
+            $missing[size($missing)] = ($i + 1) + ":" + $poses[$i];
+        }
+    }
+
+    print("=================================================\n");
+    print($captured + " of " + size($poses) + " poses captured.\n");
+    if (size($missing) > 0)
+        print("Sculpt each missing pose and run CapturePose(number);\n");
+    else if ($neutral != "")
+        print("Library complete — SaveLibraryFile(\"C:/path/name.flib\"); to protect it.\n");
+    print("\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// Save / load the whole library to a plain text file, so it is never
+// hostage to a single Maya scene. USE FORWARD SLASHES in paths.
+// ---------------------------------------------------------------------------
+global proc SaveLibraryFile(string $path)
+{
+    string $neutral = LoadFacePoseData("Neutral");
+    if ($neutral == "")
+        error "SaveLibraryFile: no Neutral in this scene — nothing worth saving. Run LibraryStatus();";
+
+    string $out = "=Neutral\n" + $neutral;
+    // Per-character extras travel in a header line. Older loaders skip it
+    // (anything before the first "=" block is ignored), so files stay compatible.
+    if (`objExists "FacePoseLib"` && `attributeExists "extraBones" "FacePoseLib"`)
+    {
+        string $extras = strip(`getAttr "FacePoseLib.extraBones"`);
+        if ($extras != "")
+            $out = "#extraBones " + $extras + "\n" + $out;
+    }
+    string $poses[] = FacePoseNames();
+    int $count = 0;
+    for ($p in $poses)
+    {
+        string $d = LoadFacePoseData($p);
+        if ($d == "") continue;
+        $out += "=" + $p + "\n" + $d;
+        $count++;
+    }
+
+    int $fileId = `fopen $path "w"`;
+    if ($fileId == 0)
+        error("SaveLibraryFile: could not open for writing (use forward slashes!): " + $path);
+    fprint $fileId $out;
+    fclose $fileId;
+
+    print("SaveLibraryFile: wrote Neutral + " + $count + " poses to " + $path + "\n");
+    if ($count < size($poses))
+        warning("SaveLibraryFile: library is incomplete (" + $count + "/" + size($poses)
+                + " poses). Run LibraryStatus(); to see what's missing.");
+}
+
+global proc LoadLibraryFile(string $path)
+{
+    int $fileId = `fopen $path "r"`;
+    if ($fileId == 0)
+        error("LoadLibraryFile: could not open (use forward slashes!): " + $path);
+
+    string $curPose = "";
+    string $curData = "";
+    int $count = 0;
+    string $extraList = "";
+
+    string $line = `fgetline $fileId`;
+    while (size($line) > 0)
+    {
+        string $trimmed = strip($line);
+        if (`gmatch $trimmed "#extraBones*"`)
+        {
+            $extraList = strip(substring($trimmed, 12, size($trimmed)));
+        }
+        else if (`gmatch $trimmed "=*"`)
+        {
+            if ($curPose != "" && $curData != "")
+            {
+                StoreFacePoseData($curPose, $curData);
+                $count++;
+            }
+            $curPose = substring($trimmed, 2, size($trimmed));
+            $curData = "";
+        }
+        else if ($trimmed != "")
+        {
+            $curData += $trimmed + "\n";
+        }
+        $line = `fgetline $fileId`;
+    }
+    fclose $fileId;
+
+    if ($curPose != "" && $curData != "")
+    {
+        StoreFacePoseData($curPose, $curData);
+        $count++;
+    }
+
+    // restore per-character extras saved with the library
+    if ($extraList != "")
+    {
+        string $lib = EnsureFacePoseLib();
+        if (!`attributeExists "extraBones" $lib`)
+            addAttr -longName "extraBones" -dataType "string" $lib;
+        setAttr -type "string" ($lib + ".extraBones") $extraList;
+        print("LoadLibraryFile: extra facial bones restored: " + $extraList + "\n");
+    }
+
+    print("LoadLibraryFile: loaded " + $count + " entries (incl. Neutral) from " + $path + "\n");
+    print("Run LibraryStatus(); to verify.\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// FILE DIALOGS — no more typing paths. ExportFaceFiles() pops a native save
+// dialog ONCE and writes BOTH files with the same base name:
+//     <name>.flib   (the Maya-side library backup/master)
+//     <name>.json   (the Unity dictionary)
+// The character name written into the JSON is the file's base name — name
+// the file after the character (e.g. "Werewolf" -> Werewolf.flib +
+// Werewolf.json, character "Werewolf").
+// ---------------------------------------------------------------------------
+global proc ExportFaceFiles()
+{
+    string $res[] = `fileDialog2 -fileMode 0
+                     -caption "Save face library (.flib + .json, same name)"
+                     -fileFilter "Face Library (*.flib)"`;
+    if (size($res) == 0)
+    {
+        print("ExportFaceFiles: cancelled.\n");
+        return;
+    }
+
+    string $base = $res[0];
+    if (`gmatch $base "*.flib"`)
+        $base = substring($base, 1, size($base) - 5);
+    else if (`gmatch $base "*.json"`)
+        $base = substring($base, 1, size($base) - 5);
+
+    string $parts[];
+    tokenize($base, "/", $parts);
+    string $charName = $parts[size($parts) - 1];
+
+    SaveLibraryFile($base + ".flib");
+    ExportPoseLibrary($base + ".json", $charName);
+    print("ExportFaceFiles: done — character '" + $charName + "'.\n");
+}
+
+global proc LoadLibraryFileUI()
+{
+    string $res[] = `fileDialog2 -fileMode 1
+                     -caption "Load face library"
+                     -fileFilter "Face Library (*.flib)"`;
+    if (size($res) == 0)
+    {
+        print("LoadLibraryFileUI: cancelled.\n");
+        return;
+    }
+    LoadLibraryFile($res[0]);
+}
+
+
+// ---------------------------------------------------------------------------
+// Create the FacePoses weight node under Root with 29 keyable 0-1 attrs.
+// Inert in Maya; rides into FBX as animated custom attributes.
+// ---------------------------------------------------------------------------
+global proc CreateFacePosesNode()
+{
+    string $node = "FacePoses";
+    if (!`objExists $node`)
+    {
+        if (`objExists "Root"`)
+        {
+            createNode "transform" -name $node -parent "Root";
+        }
+        else
+        {
+            createNode "transform" -name $node;
+            warning("CreateFacePosesNode: no 'Root' in scene — FacePoses created at world. Parent it under Root before export.");
+        }
+    }
+
+    string $poses[] = FacePoseNames();
+    int $added = 0;
+    for ($p in $poses)
+    {
+        if (!`attributeExists $p $node`)
+        {
+            addAttr -longName $p -attributeType "double"
+                    -minValue 0 -maxValue 1 -defaultValue 0 -keyable 1 $node;
+            $added++;
+        }
+    }
+    print("CreateFacePosesNode: '" + $node + "' ready (" + $added + " attrs added, "
+          + size($poses) + " total).\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// JSON export helper: stored lines -> JSON bone entries.
+// ---------------------------------------------------------------------------
+global proc string FacePoseLinesToJson(string $data, string $indent)
+{
+    string $out = "";
+    int $first = 1;
+    string $lines[];
+    tokenize($data, "\n", $lines);
+    for ($line in $lines)
+    {
+        string $tok[];
+        int $n = tokenize($line, " ", $tok);
+        if ($n != 7) continue;
+        if (!$first) $out += ",\n";
+        $first = 0;
+        $out += $indent + "{\"bone\":\"" + $tok[0] + "\","
+              + "\"t\":[" + $tok[1] + "," + $tok[2] + "," + $tok[3] + "],"
+              + "\"r\":[" + $tok[4] + "," + $tok[5] + "," + $tok[6] + "]}";
+    }
+    return $out;
+}
+
+
+// ---------------------------------------------------------------------------
+// Write the Unity pose-library JSON. Refuses to write an unusable library.
+// USE FORWARD SLASHES in the path (backslashes get eaten by MEL strings).
+//   ExportPoseLibrary("C:/game/face_poses_Human.json", "Human");
+// ---------------------------------------------------------------------------
+global proc ExportPoseLibrary(string $path, string $characterName)
+{
+    string $neutral = LoadFacePoseData("Neutral");
+    if ($neutral == "")
+    {
+        error "ExportPoseLibrary: no Neutral in this scene. Run LibraryStatus(); — you may need LoadLibraryFile or a capture pass.";
+    }
+
+    string $poses[] = FacePoseNames();
+    string $missing[];
+    string $body = "";
+    int $first = 1;
+    int $count = 0;
+    for ($p in $poses)
+    {
+        string $d = LoadFacePoseData($p);
+        if ($d == "")
+        {
+            $missing[size($missing)] = $p;
+            continue;
+        }
+        if (!$first) $body += ",\n";
+        $first = 0;
+        $body += "  {\"name\":\"" + $p + "\",\"bones\":[\n"
+               + FacePoseLinesToJson($d, "    ")
+               + "\n  ]}";
+        $count++;
+    }
+
+    if ($count == 0)
+    {
+        error "ExportPoseLibrary: ZERO poses captured in this scene — nothing to export. Run LibraryStatus(); (wrong scene? library never saved? use LoadLibraryFile if you saved a .flib).";
+    }
+    if (size($missing) > 0)
+    {
+        warning("ExportPoseLibrary: " + size($missing) + " poses missing and left out: "
+                + stringArrayToString($missing, ", "));
+    }
+
+    string $json = "{\n\"character\": \"" + $characterName + "\",\n\"neutral\": [\n";
+    $json += FacePoseLinesToJson($neutral, "  ");
+    $json += "\n],\n\"poses\": [\n" + $body + "\n]\n}\n";
+
+    int $fileId = `fopen $path "w"`;
+    if ($fileId == 0)
+    {
+        error("ExportPoseLibrary: could not open file for writing (use forward slashes!): " + $path);
+    }
+    fprint $fileId $json;
+    fclose $fileId;
+
+    print("ExportPoseLibrary: wrote " + $count + " of " + size($poses) + " poses for '"
+          + $characterName + "' to " + $path + "\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// LIBRARY AUDIT — machine-detectable anomaly flags. These are REVIEW ITEMS,
+// not errors: the code can't judge whether a pose looks right, but it can
+// spot the structural fingerprints of capture mistakes:
+//   A. RESIDUE: the same bone carrying a near-identical delta across 4+
+//      poses — the signature of a control that drifted off neutral and got
+//      baked into everything captured afterward.
+//   B. CROSS-SIDE: a core _R bone inside a _L pose (or vice versa) — fine
+//      if deliberate, but usually contamination. Per-character extra bones
+//      (ears etc.) are exempt: posing both ears in a one-sided pose is
+//      normal.
+// Runs automatically at the end of CaptureAllPoseFrames; callable any time.
+// ---------------------------------------------------------------------------
+global proc AuditPoseLibrary()
+{
+    print("\n===== Library Audit (review items, not errors) =====\n");
+    string $poses[] = FacePoseNames();
+    int $flags = 0;
+
+    // ---- Check A: repeated near-identical deltas (residue) ----
+    float $tEps = 0.002;
+    float $rEps = 0.05;
+    string $bones[] = FacePoseBones();
+    for ($b in $bones)
+    {
+        string $inPoses[];
+        float $vals[];
+        for ($i = 0; $i < size($poses); $i++)
+        {
+            string $data = LoadFacePoseData($poses[$i]);
+            if ($data == "") continue;
+            string $lines[];
+            tokenize($data, "\n", $lines);
+            for ($line in $lines)
+            {
+                string $tok[];
+                int $n = tokenize($line, " ", $tok);
+                if ($n != 7 || $tok[0] != $b) continue;
+                int $o = size($inPoses);
+                $inPoses[$o] = $poses[$i];
+                for ($c = 0; $c < 6; $c++)
+                    $vals[$o * 6 + $c] = (float) $tok[$c + 1];
+            }
+        }
+
+        if (size($inPoses) < 4) continue;
+
+        // compare every occurrence to the first
+        string $matching[];
+        $matching[0] = $inPoses[0];
+        for ($o = 1; $o < size($inPoses); $o++)
+        {
+            int $same = 1;
+            for ($c = 0; $c < 6; $c++)
+            {
+                float $eps = ($c < 3) ? $tEps : $rEps;
+                if (abs($vals[$o * 6 + $c] - $vals[$c]) > $eps)
+                {
+                    $same = 0;
+                    break;
+                }
+            }
+            if ($same)
+                $matching[size($matching)] = $inPoses[$o];
+        }
+        if (size($matching) >= 4)
+        {
+            print("  RESIDUE?  " + $b + " has a near-identical delta in "
+                  + size($matching) + " poses: "
+                  + stringArrayToString($matching, ", ") + "\n");
+            print("            -> if unintended: RemoveBoneFromPoses(\"" + $b + "\", {numbers});\n");
+            $flags++;
+        }
+    }
+
+    // ---- Check B: cross-side core bones in sided poses ----
+    string $core[] = CoreFaceBones();
+    for ($i = 0; $i < size($poses); $i++)
+    {
+        string $p = $poses[$i];
+        string $badSuffix = "";
+        if (`gmatch $p "*_L"`) $badSuffix = "*_R";
+        else if (`gmatch $p "*_R"`) $badSuffix = "*_L";
+        else continue;
+
+        string $data = LoadFacePoseData($p);
+        if ($data == "") continue;
+
+        string $lines[];
+        tokenize($data, "\n", $lines);
+        for ($line in $lines)
+        {
+            string $tok[];
+            int $n = tokenize($line, " ", $tok);
+            if ($n != 7) continue;
+            if (!`gmatch $tok[0] $badSuffix`) continue;
+            int $isCore = 0;
+            for ($c2 in $core)
+                if ($c2 == $tok[0]) { $isCore = 1; break; }
+            if (!$isCore) continue;   // extras exempt
+
+            print("  CROSS-SIDE?  pose " + ($i + 1) + " " + $p + " contains "
+                  + $tok[0] + " (fine if deliberate)\n");
+            $flags++;
+        }
+    }
+
+    if ($flags == 0)
+        print("  No anomalies found.\n");
+    print("====================================================\n\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// LIBRARY CLEANUP — for removing stray bone entries captured by accident
+// (e.g. a lip corner that drifted off neutral mid-session and got baked
+// into every subsequent pose).
+//
+//   FindBoneInPoses("LipCorner_R");    // where does this bone appear, and
+//                                      // how big is its delta in each pose?
+//                                      // Strays show the SAME tiny magnitude
+//                                      // repeated across many poses.
+//   RemoveBoneFromPose(26, "LipCorner_R");            // surgical, one pose
+//   RemoveBoneFromPoses("LipCorner_R", {12,13,14});   // batch, one command
+//
+// After cleaning: LibraryStatus(); SaveLibraryFile(...); ExportPoseLibrary(...)
+// Only the JSON needs re-exporting — the FBX weight curves are unaffected.
+// ---------------------------------------------------------------------------
+global proc FindBoneInPoses(string $boneName)
+{
+    string $poses[] = FacePoseNames();
+    print("\n===== '" + $boneName + "' appears in: =====\n");
+    int $hits = 0;
+    for ($i = 0; $i < size($poses); $i++)
+    {
+        string $data = LoadFacePoseData($poses[$i]);
+        if ($data == "") continue;
+
+        string $lines[];
+        tokenize($data, "\n", $lines);
+        for ($line in $lines)
+        {
+            string $tok[];
+            int $n = tokenize($line, " ", $tok);
+            if ($n != 7 || $tok[0] != $boneName) continue;
+
+            float $tx = (float)$tok[1]; float $ty = (float)$tok[2]; float $tz = (float)$tok[3];
+            float $rx = (float)$tok[4]; float $ry = (float)$tok[5]; float $rz = (float)$tok[6];
+            float $tMag = sqrt($tx*$tx + $ty*$ty + $tz*$tz);
+            float $rMag = sqrt($rx*$rx + $ry*$ry + $rz*$rz);
+            print("  pose " + ($i + 1) + "\t" + $poses[$i]
+                  + "\tt=" + $tMag + "\tr=" + $rMag + " deg\n");
+            $hits++;
+        }
+    }
+    if ($hits == 0)
+        print("  (none)\n");
+    print("=========================================\n");
+    print("Identical tiny t/r values repeated across unrelated poses = a stray\n");
+    print("captured off-neutral. Remove with RemoveBoneFromPose(number, bone).\n\n");
+}
+
+global proc RemoveBoneFromPose(int $poseNumber, string $boneName)
+{
+    string $poses[] = FacePoseNames();
+    int $idx = $poseNumber - 1;
+    if ($idx < 0 || $idx >= size($poses))
+    {
+        error("RemoveBoneFromPose: number " + $poseNumber + " is outside the table (1-"
+              + size($poses) + "). Run PoseTable();");
+    }
+    string $poseName = $poses[$idx];
+
+    string $data = LoadFacePoseData($poseName);
+    if ($data == "")
+    {
+        warning("RemoveBoneFromPose: pose '" + $poseName + "' has no data — nothing to remove.");
+        return;
+    }
+
+    string $out = "";
+    int $removed = 0;
+    int $kept = 0;
+    string $lines[];
+    tokenize($data, "\n", $lines);
+    for ($line in $lines)
+    {
+        string $tok[];
+        int $n = tokenize($line, " ", $tok);
+        if ($n != 7) continue;
+        if ($tok[0] == $boneName)
+        {
+            $removed++;
+            continue;
+        }
+        $out += $line + "\n";
+        $kept++;
+    }
+
+    if ($removed == 0)
+    {
+        warning("RemoveBoneFromPose: '" + $boneName + "' is not in pose '" + $poseName + "'.");
+        return;
+    }
+    if ($kept == 0)
+    {
+        warning("RemoveBoneFromPose: that was the ONLY bone in '" + $poseName
+                + "' — removing it would empty the pose. Not removed; recapture the pose instead.");
+        return;
+    }
+
+    StoreFacePoseData($poseName, $out);
+    print("RemoveBoneFromPose: removed '" + $boneName + "' from " + $poseName
+          + " (" + $kept + " bones remain).\n");
+}
+
+global proc RemoveBoneFromPoses(string $boneName, int $poseNumbers[])
+{
+    for ($n in $poseNumbers)
+    {
+        RemoveBoneFromPose($n, $boneName);
+    }
+    print("RemoveBoneFromPoses: done. Now: LibraryStatus(); SaveLibraryFile(...); ExportPoseLibrary(...);\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// Usage help — printed when the file is sourced/pasted.
+// ---------------------------------------------------------------------------
+global proc FacePoseToolsHelp()
+{
+    print("\n================ face_pose_tools.mel ================\n");
+    print("Pose-by-pose workflow (numbers from PoseTable, no timeline):\n");
+    print("  PoseTable();               // the number <-> pose table\n");
+    print("  SaveNeutral();             // 1. face at rest, once\n");
+    print("  // 2. sculpt a pose (controls / Studio Library — no keys needed)\n");
+    print("  CapturePose(2);            // 3. capture current face as #2 (Smile_L)\n");
+    print("  //    repeat 2-3 per pose; reset controls between poses\n");
+    print("  MirrorPose(2);             // optional: Smile_L -> Smile_R (face at rest)\n");
+    print("  MirrorPoseLeftToRight(N); MirrorPoseRightToLeft(N);  // pick the direction\n");
+    print("  MirrorReport();            // how each L/R bone pair mirrors\n");
+    print("  PreviewPose(2, 1.0);       // check it (bare skeleton); ResetFace();\n");
+    print("  LibraryStatus();           // what's captured, what's MISSING\n");
+    print("  ExportFaceFiles();         // save .flib + .json (file dialog)\n");
+    print("  LoadLibraryFileUI();       // restore a library (file dialog)\n");
+    print("  AuditPoseLibrary();        // flag residue / cross-side anomalies\n");
+    print("  FindBoneInPoses(\"LipCorner_R\");   // hunt stray captured bones\n");
+    print("  RemoveBoneFromPoses(\"LipCorner_R\", {12,13});  // strip strays\n");
+    print("  AddFacialBone(\"Ear_L\");   // per-character extra bones (BEFORE SaveNeutral)\n");
+    print("Bulk route: key frames 0-29 (PoseTable), CaptureAllPoseFrames(0);\n");
+    print("  -> per-pose bone log + automatic audit at the end.\n");
+    print("  CaptureAllAndExport(0);    // one swoop: + FacePoses node (if\n");
+    print("  //   missing) + save dialog for .flib and .json together\n");
+    print("  CreateFacePosesNode();     // weight attrs under Root (for FBX)\n");
+    print("  ExportPoseLibrary(\"C:/path/face_poses_Human.json\", \"Human\");\n");
+    print("Paths: ALWAYS forward slashes. Timeline route still available:\n");
+    print("  key frames 0-29 per PoseTable, then CaptureAllPoseFrames(0);\n");
+    print("=====================================================\n\n");
+}
+
+FacePoseToolsHelp();

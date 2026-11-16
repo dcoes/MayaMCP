@@ -1,0 +1,555 @@
+// ---------------------------------------------------------------------------
+// face_pose_ui.mel
+//
+// ONE WINDOW for the facial pose pipeline.
+//
+//   FacePoseUI();        // open the window (runs automatically when pasted)
+//
+// The window is a front end, nothing more. Every button runs the SAME
+// command you would type, echoed in the Script Editor, so the typed
+// workflow stays learnable. The tools themselves live in the pipeline
+// scripts, which must be loaded in this Maya session: use
+// Scripts > "Load Pipeline Scripts..." once (it remembers the folder), or
+// paste them yourself. Buttons whose script isn't loaded warn instead of
+// failing. The pose list works on its own (read-only) either way.
+//
+// Conventions: plain PascalCase procs, fully self-contained (the helpers
+// below are identical copies of the ones in face_pose_tools.mel),
+// forward slashes in every path, auto-run at the bottom.
+// ---------------------------------------------------------------------------
+
+
+// --------- identical copies of the face_pose_tools.mel helpers --------------
+global proc string[] CoreFaceBones()
+{
+    string $bones[] = {
+        "Jaw", "UpperLip_Mid", "LowerLip_Mid", "Brow0_Mid",
+        "Eye_L", "Eye_R",
+        "UpperEyelid_L", "UpperEyelid_R",
+        "LowerEyelid_L", "LowerEyelid_R",
+        "Brow0_L", "Brow0_R",
+        "Brow1_L", "Brow1_R",
+        "CheekBone_L", "CheekBone_R",
+        "LipCorner_L", "LipCorner_R"
+    };
+    return $bones;
+}
+
+global proc string[] FacePoseBones()
+{
+    string $bones[] = CoreFaceBones();
+    if (`objExists "FacePoseLib"` && `attributeExists "extraBones" "FacePoseLib"`)
+    {
+        string $extra = `getAttr "FacePoseLib.extraBones"`;
+        string $tok[];
+        tokenize($extra, " ", $tok);
+        for ($t in $tok)
+        {
+            if ($t != "")
+                $bones[size($bones)] = $t;
+        }
+    }
+    return $bones;
+}
+
+global proc string[] FacePoseNames()
+{
+    string $poses[] = {
+        // Mouth (11)
+        "JawOpen",
+        "Smile_L", "Smile_R",
+        "Frown_L", "Frown_R",
+        "MouthWide_L", "MouthWide_R",
+        "MouthNarrow_L", "MouthNarrow_R",
+        "UpperLipRaise",
+        "LowerLipDown",
+        // Brows (6)
+        "BrowUp_L", "BrowUp_R",
+        "BrowSad_L", "BrowSad_R",
+        "BrowAngry_L", "BrowAngry_R",
+        // Eyes (10)
+        "Blink_L", "Blink_R",
+        "EyeWide_L", "EyeWide_R",
+        "Squint_L", "Squint_R",
+        "EyesUp", "EyesDown", "EyesLeft", "EyesRight",
+        // Cheeks (2)
+        "CheekRaise_L", "CheekRaise_R"
+    };
+    return $poses;
+}
+
+global proc string FacePoseNodeName(string $poseName)
+{
+    return ("FPose_" + $poseName);
+}
+
+global proc string LoadFacePoseData(string $poseName)
+{
+    string $node = FacePoseNodeName($poseName);
+    if (!`objExists $node`) return "";
+    if (!`attributeExists "poseData" $node`) return "";
+    string $data = `getAttr ($node + ".poseData")`;
+    return $data;
+}
+// ---------------------------------------------------------------------------
+
+
+// ===========================================================================
+//  PLUMBING
+// ===========================================================================
+
+// Runs one pipeline command if its proc is loaded; echoes it; refreshes the list.
+global proc int FacePoseUIRun(string $procName, string $cmd)
+{
+    if (!`exists $procName`)
+    {
+        warning("Face Pose Tools: '" + $procName + "' isn't loaded in this Maya session. Use Scripts > Load Pipeline Scripts..., or paste the script that defines it.");
+        return 0;
+    }
+    int $failed = catch(evalEcho($cmd));
+    FacePoseUIRefresh();
+    return !$failed;
+}
+
+global proc int FacePoseUISolverLoaded()
+{
+    int $ok = python("int('SolveFaceWeights' in dir(__import__('__main__')))");
+    return $ok;
+}
+
+// Runs a solver function (Python) if the solver is loaded; echoes it.
+global proc FacePoseUIRunPython(string $call)
+{
+    if (!FacePoseUISolverLoaded())
+    {
+        warning "Face Pose Tools: face_weight_solver.py isn't loaded. Use Scripts > Load Pipeline Scripts..., or paste it in the PYTHON tab.";
+        return;
+    }
+    print("python(\"" + $call + "\");\n");
+    catch(python($call));
+    FacePoseUIRefresh();
+}
+
+global proc string FacePoseUIRow(int $n, string $name, string $state)
+{
+    string $num = $n;
+    if ($n < 10) $num = " " + $num;
+    string $nm = $name;
+    while (size($nm) < 16) $nm += " ";
+    return ($num + "  " + $nm + $state);
+}
+
+// Selected pose NUMBERS (0 = Neutral, 1-29 = PoseTable).
+global proc int[] FacePoseUISelectedPoses()
+{
+    int $sel[] = `textScrollList -q -selectIndexedItem FacePoseUIPoseList`;
+    int $out[];
+    for ($s in $sel)
+        $out[size($out)] = $s - 1;          // row 1 is Neutral (#0)
+    return $out;
+}
+
+global proc string[] FacePoseUISelectedJoints()
+{
+    string $sel[] = `ls -selection -type joint`;
+    string $out[];
+    for ($s in $sel)
+    {
+        string $parts[];
+        int $np = tokenize($s, "|", $parts);
+        $out[size($out)] = $parts[$np - 1];
+    }
+    return $out;
+}
+
+global proc FacePoseUIRefresh()
+{
+    if (!`window -exists FacePoseUIWin`) return;
+
+    int $keep[] = `textScrollList -q -selectIndexedItem FacePoseUIPoseList`;
+    textScrollList -e -removeAll FacePoseUIPoseList;
+
+    string $poses[] = FacePoseNames();
+    string $nState = "--";
+    if (LoadFacePoseData("Neutral") != "") $nState = "ok";
+    textScrollList -e -append (FacePoseUIRow(0, "Neutral", $nState)) FacePoseUIPoseList;
+
+    int $have = 0;
+    for ($i = 0; $i < size($poses); $i++)
+    {
+        string $st = "--";
+        if (LoadFacePoseData($poses[$i]) != "") { $st = "ok"; $have++; }
+        textScrollList -e -append (FacePoseUIRow($i + 1, $poses[$i], $st)) FacePoseUIPoseList;
+    }
+    for ($k in $keep)
+        textScrollList -e -selectIndexedItem $k FacePoseUIPoseList;
+
+    string $core[] = CoreFaceBones();
+    string $all[] = FacePoseBones();
+    int $extras = size($all) - size($core);
+    text -e -label ("Neutral: " + $nState + "     Poses: " + $have + " / " + size($poses)
+                    + "     Bones: " + size($core) + " + " + $extras + " extra") FacePoseUIStatus;
+
+    string $procs[]  = { "CapturePose", "ConnectFacePoses", "TransferPoseLibrary" };
+    string $labels[] = { "tools", "preview", "transfer" };
+    string $l = "Loaded: ";
+    for ($i = 0; $i < 3; $i++)
+    {
+        string $mark = "[ ]";
+        if (`exists $procs[$i]`) $mark = "[x]";
+        $l += "  " + $labels[$i] + " " + $mark;
+    }
+    string $solverMark = "[ ]";
+    if (FacePoseUISolverLoaded()) $solverMark = "[x]";
+    $l += "  solver " + $solverMark;
+    text -e -label $l FacePoseUILoaded;
+}
+
+
+// ===========================================================================
+//  BUTTONS
+// ===========================================================================
+
+// ---- poses -----------------------------------------------------------------
+global proc FacePoseUISaveNeutral()
+{
+    FacePoseUIRun("SaveNeutral", "SaveNeutral();");
+}
+
+global proc FacePoseUICapture()
+{
+    int $sel[] = FacePoseUISelectedPoses();
+    if (size($sel) != 1) { warning "Select exactly one pose in the list to capture."; return; }
+    FacePoseUIRun("CapturePose", "CapturePose(" + $sel[0] + ");");
+}
+
+global proc FacePoseUIPreview()
+{
+    int $sel[] = FacePoseUISelectedPoses();
+    if (size($sel) != 1) { warning "Select exactly one pose in the list to preview."; return; }
+    float $w = `floatSliderGrp -q -value FacePoseUIWeight`;
+    FacePoseUIRun("PreviewPose", "PreviewPose(" + $sel[0] + ", " + $w + ");");
+}
+
+global proc FacePoseUIResetFace()
+{
+    FacePoseUIRun("ResetFace", "ResetFace();");
+}
+
+// Which pose a mirror reads and writes, using the side rules in
+// face_pose_tools.mel (called through eval, so this file only runs them
+// once the tools are loaded). Empty array when there is no partner.
+global proc string[] FacePoseUIMirrorPair(int $n, string $fromSide)
+{
+    string $none[];
+    string $poses[] = FacePoseNames();
+    if ($n < 1 || $n > size($poses)) return $none;
+    string $picked = $poses[$n - 1];
+    string $side = eval("FaceSideOf(\"" + $picked + "\")");
+    string $src = $picked;
+    if ($side != "" && $side != $fromSide)
+        $src = eval("FaceSwapSide(\"" + $picked + "\")");
+    string $dst = eval("FaceSwapSide(\"" + $src + "\")");
+    if (!stringArrayContains($src, $poses) || !stringArrayContains($dst, $poses))
+        return $none;
+    string $pair[] = { $src, $dst };
+    return $pair;
+}
+
+global proc FacePoseUIMirror(string $fromSide)
+{
+    if (!`exists "MirrorFacePose"`)
+    {
+        warning "Face Pose Tools: the mirror lives in face_pose_tools.mel, which isn't loaded (or is an older copy). Load the current one.";
+        return;
+    }
+    int $sel[] = FacePoseUISelectedPoses();
+    if (size($sel) == 0) { warning "Select one or more poses to mirror."; return; }
+
+    string $procName = "MirrorPoseLeftToRight";
+    if ($fromSide == "R") $procName = "MirrorPoseRightToLeft";
+
+    string $done[];
+    int $overwriteAll = 0;
+    for ($n in $sel)
+    {
+        if ($n == 0) { warning "Neutral isn't mirrored, skipped."; continue; }
+        string $pair[] = FacePoseUIMirrorPair($n, $fromSide);
+        if (size($pair) != 2)
+        {
+            warning("Mirror: pose #" + $n + " has no partner pose, skipped.");
+            continue;
+        }
+        if (stringArrayContains($pair[1], $done)) continue;   // both halves of a pair selected
+        $done[size($done)] = $pair[1];
+
+        if (!$overwriteAll && LoadFacePoseData($pair[1]) != "")
+        {
+            string $msg = "Overwrite captured '" + $pair[1] + "' with a mirror of '" + $pair[0] + "'?";
+            if ($pair[0] == $pair[1])
+                $msg = "Rebuild the other side of captured '" + $pair[1] + "' from this side?";
+            string $ans = `confirmDialog -title "Mirror" -message $msg
+                           -button "Yes" -button "Yes to all" -button "Skip" -button "Stop"
+                           -defaultButton "Yes" -cancelButton "Stop" -dismissString "Stop"`;
+            if ($ans == "Stop") break;
+            if ($ans == "Skip") continue;
+            if ($ans == "Yes to all") $overwriteAll = 1;
+        }
+        FacePoseUIRun($procName, $procName + "(" + $n + ");");
+    }
+}
+
+global proc FacePoseUIMirrorReport() { FacePoseUIRun("MirrorReport", "MirrorReport();"); }
+
+// ---- library ---------------------------------------------------------------
+global proc FacePoseUILibraryStatus() { FacePoseUIRun("LibraryStatus", "LibraryStatus();"); }
+global proc FacePoseUIPoseTable()     { FacePoseUIRun("PoseTable", "PoseTable();"); }
+global proc FacePoseUIAudit()         { FacePoseUIRun("AuditPoseLibrary", "AuditPoseLibrary();"); }
+global proc FacePoseUIExport()        { FacePoseUIRun("ExportFaceFiles", "ExportFaceFiles();"); }
+global proc FacePoseUILoad()          { FacePoseUIRun("LoadLibraryFileUI", "LoadLibraryFileUI();"); }
+
+// ---- facial bones ----------------------------------------------------------
+global proc FacePoseUIAddBones()
+{
+    string $j[] = FacePoseUISelectedJoints();
+    if (size($j) == 0) { warning "Select the extra facial joints in the viewport or Outliner first."; return; }
+    for ($b in $j) FacePoseUIRun("AddFacialBone", "AddFacialBone(\"" + $b + "\");");
+}
+
+global proc FacePoseUIRemoveBones()
+{
+    string $j[] = FacePoseUISelectedJoints();
+    if (size($j) == 0) { warning "Select the facial joints to unregister first."; return; }
+    for ($b in $j) FacePoseUIRun("RemoveFacialBone", "RemoveFacialBone(\"" + $b + "\");");
+}
+
+global proc FacePoseUIListBones() { FacePoseUIRun("ListFacialBones", "ListFacialBones();"); }
+
+global proc FacePoseUIFindBone()
+{
+    string $j[] = FacePoseUISelectedJoints();
+    if (size($j) != 1) { warning "Select exactly one joint."; return; }
+    FacePoseUIRun("FindBoneInPoses", "FindBoneInPoses(\"" + $j[0] + "\");");
+}
+
+global proc FacePoseUIRemoveBoneFromPoses()
+{
+    string $j[] = FacePoseUISelectedJoints();
+    if (size($j) != 1) { warning "Select exactly one joint (the stray bone)."; return; }
+    int $sel[] = FacePoseUISelectedPoses();
+    string $nums = "";
+    for ($n in $sel)
+    {
+        if ($n == 0) continue;
+        if ($nums != "") $nums += ",";
+        $nums += $n;
+    }
+    if ($nums == "") { warning "Select the poses to strip it from (not Neutral)."; return; }
+    string $ans = `confirmDialog -title "Remove stray bone"
+                   -message ("Remove '" + $j[0] + "' from poses " + $nums + "?")
+                   -button "Remove" -button "Cancel" -defaultButton "Cancel"
+                   -cancelButton "Cancel" -dismissString "Cancel"`;
+    if ($ans != "Remove") return;
+    FacePoseUIRun("RemoveBoneFromPoses", "RemoveBoneFromPoses(\"" + $j[0] + "\", {" + $nums + "});");
+}
+
+// ---- timeline route --------------------------------------------------------
+global proc FacePoseUICaptureAll()
+{
+    int $f = `intFieldGrp -q -value1 FacePoseUIStartFrame`;
+    FacePoseUIRun("CaptureAllPoseFrames", "CaptureAllPoseFrames(" + $f + ");");
+}
+
+global proc FacePoseUICaptureAllExport()
+{
+    int $f = `intFieldGrp -q -value1 FacePoseUIStartFrame`;
+    FacePoseUIRun("CaptureAllAndExport", "CaptureAllAndExport(" + $f + ");");
+}
+
+// ---- animation, preview, Unity ----------------------------------------------
+global proc FacePoseUICreateNode()  { FacePoseUIRun("CreateFacePosesNode", "CreateFacePosesNode();"); }
+global proc FacePoseUIConnect()     { FacePoseUIRun("ConnectFacePoses", "ConnectFacePoses();"); }
+global proc FacePoseUIDisconnect()  { FacePoseUIRun("DisconnectFacePoses", "DisconnectFacePoses();"); }
+global proc FacePoseUISolve()       { FacePoseUIRunPython("SolveFaceWeights()"); }
+
+global proc FacePoseUICutKeys()
+{
+    string $ans = `confirmDialog -title "Cut facial bone keys"
+                   -message "Delete the animation curves on every facial bone?\nOnly after the solved weights are checked, and on a COPY of the file."
+                   -button "Delete" -button "Cancel" -defaultButton "Cancel"
+                   -cancelButton "Cancel" -dismissString "Cancel"`;
+    if ($ans != "Delete") return;
+    FacePoseUIRunPython("CutFacialBoneKeys()");
+}
+
+// ---- transfer --------------------------------------------------------------
+global proc FacePoseUIExportRaw()
+{
+    string $p[] = `fileDialog2 -fileMode 0 -caption "Export raw pose library"
+                   -fileFilter "Raw pose library (*.raw)"`;
+    if (size($p) == 0) return;
+    string $path = fromNativePath($p[0]);
+    FacePoseUIRun("ExportPoseLibraryRaw", "ExportPoseLibraryRaw(\"" + $path + "\");");
+}
+
+global proc FacePoseUITransferRaw()
+{
+    string $p[] = `fileDialog2 -fileMode 1 -caption "Transfer from raw pose library"
+                   -fileFilter "Raw pose library (*.raw)"`;
+    if (size($p) == 0) return;
+    string $path = fromNativePath($p[0]);
+    int $f = `intFieldGrp -q -value1 FacePoseUIStartFrame`;
+    FacePoseUIRun("TransferPoseLibrary", "TransferPoseLibrary(\"" + $path + "\", " + $f + ");");
+}
+
+// ---- script loading --------------------------------------------------------
+// Sources the pipeline scripts from one folder. Their own copies of the
+// shared helpers replace the ones in this file, which is expected: they are
+// identical, and if a future version of a script changes them, the window
+// follows that version.
+global proc FacePoseUILoadScripts()
+{
+    string $dirs[];
+    if (`optionVar -exists "FacePoseUIScriptDir"`)
+    {
+        string $start = `optionVar -q "FacePoseUIScriptDir"`;
+        $dirs = `fileDialog2 -fileMode 3 -caption "Folder with the facial pipeline scripts" -startingDirectory $start`;
+    }
+    else
+        $dirs = `fileDialog2 -fileMode 3 -caption "Folder with the facial pipeline scripts"`;
+    if (size($dirs) == 0) return;
+
+    string $dir = fromNativePath($dirs[0]);
+    optionVar -stringValue "FacePoseUIScriptDir" $dir;
+
+    string $mels[] = { "face_pose_tools.mel", "connect_face_poses.mel", "transfer_pose_library.mel" };
+    for ($m in $mels)
+    {
+        string $path = $dir + "/" + $m;
+        if (`filetest -r $path`)
+        {
+            if (catch(eval("source \"" + $path + "\"")))
+                warning("Face Pose Tools: error while loading " + $path);
+            else
+                print("Face Pose Tools: loaded " + $path + "\n");
+        }
+        else
+            print("Face Pose Tools: not found (skipped) " + $path + "\n");
+    }
+
+    // the solver only defines functions and prints one line when loaded
+    string $py = $dir + "/face_weight_solver.py";
+    if (`filetest -r $py`)
+    {
+        if (catch(python("exec(open(r'" + $py + "').read(), __import__('__main__').__dict__)")))
+            warning("Face Pose Tools: error while loading " + $py);
+        else
+            print("Face Pose Tools: loaded " + $py + "\n");
+    }
+    else
+        print("Face Pose Tools: not found (skipped) " + $py + "\n");
+
+    FacePoseUIRefresh();
+}
+
+
+// ===========================================================================
+//  LAYOUT
+// ===========================================================================
+global proc string FacePoseUISection(string $parent, string $label, int $collapsed)
+{
+    frameLayout -parent $parent -label $label -collapsable true -collapse $collapsed
+                -marginWidth 4 -marginHeight 4;
+    string $col = `columnLayout -adjustableColumn true -rowSpacing 3`;
+    return $col;
+}
+
+global proc string FacePoseUIGrid(string $parent)
+{
+    string $g = `gridLayout -parent $parent -numberOfColumns 2 -cellWidthHeight 178 26`;
+    return $g;
+}
+
+global proc FacePoseUI()
+{
+    if (`window -exists FacePoseUIWin`) deleteUI FacePoseUIWin;
+    window -title "Face Pose Tools" -widthHeight 390 800 -sizeable true FacePoseUIWin;
+
+    scrollLayout -childResizable true;
+    string $main = `columnLayout -adjustableColumn true -rowSpacing 4`;
+
+    text -parent $main -label "" -align "left" -font "boldLabelFont" FacePoseUIStatus;
+    text -parent $main -label "" -align "left" FacePoseUILoaded;
+
+    // --- Poses ---
+    string $c = FacePoseUISection($main, "Poses  (click to select, Ctrl/Shift for several)", 0);
+    textScrollList -parent $c -numberOfRows 16 -allowMultiSelection true
+                   -font "fixedWidthFont" FacePoseUIPoseList;
+    string $g = FacePoseUIGrid($c);
+    button -parent $g -label "Save Neutral"          -command "FacePoseUISaveNeutral()";
+    button -parent $g -label "Capture Selected"      -command "FacePoseUICapture()";
+    button -parent $g -label "Mirror  L -> R"        -command "FacePoseUIMirror(\"L\")";
+    button -parent $g -label "Mirror  R -> L"        -command "FacePoseUIMirror(\"R\")";
+    button -parent $g -label "Mirror Report"         -command "FacePoseUIMirrorReport()";
+    button -parent $g -label "Refresh List"          -command "FacePoseUIRefresh()";
+    floatSliderGrp -parent $c -label "Preview weight" -field true
+                   -minValue 0 -maxValue 1 -value 1 -precision 2
+                   -columnWidth3 90 50 100 FacePoseUIWeight;
+    $g = FacePoseUIGrid($c);
+    button -parent $g -label "Preview Selected"      -command "FacePoseUIPreview()";
+    button -parent $g -label "Reset Face"            -command "FacePoseUIResetFace()";
+    text -parent $c -align "left" -label "Preview and Reset need a bare skeleton (rig-driven channels are skipped).";
+
+    // --- Library ---
+    $c = FacePoseUISection($main, "Library", 0);
+    $g = FacePoseUIGrid($c);
+    button -parent $g -label "Library Status"        -command "FacePoseUILibraryStatus()";
+    button -parent $g -label "Pose Table"            -command "FacePoseUIPoseTable()";
+    button -parent $g -label "Audit Library"         -command "FacePoseUIAudit()";
+    button -parent $g -label "Save .flib + .json"    -command "FacePoseUIExport()";
+    button -parent $g -label "Load .flib"            -command "FacePoseUILoad()";
+
+    // --- Facial bones ---
+    $c = FacePoseUISection($main, "Facial Bones  (select joints in the scene)", 1);
+    $g = FacePoseUIGrid($c);
+    button -parent $g -label "Add as Extra Bones"    -command "FacePoseUIAddBones()";
+    button -parent $g -label "Remove Extra Bones"    -command "FacePoseUIRemoveBones()";
+    button -parent $g -label "List Facial Bones"     -command "FacePoseUIListBones()";
+    button -parent $g -label "Find Joint in Poses"   -command "FacePoseUIFindBone()";
+    button -parent $c -label "Remove Joint From Selected Poses" -command "FacePoseUIRemoveBoneFromPoses()";
+    text -parent $c -align "left" -label "After adding extras, Save Neutral again (face at rest).";
+
+    // --- Timeline route ---
+    $c = FacePoseUISection($main, "Timeline Capture (optional route)", 1);
+    intFieldGrp -parent $c -label "Start frame" -value1 0
+                -columnWidth2 90 60 FacePoseUIStartFrame;
+    $g = FacePoseUIGrid($c);
+    button -parent $g -label "Capture All Frames"    -command "FacePoseUICaptureAll()";
+    button -parent $g -label "Capture All + Export"  -command "FacePoseUICaptureAllExport()";
+
+    // --- Animation / preview / Unity ---
+    $c = FacePoseUISection($main, "Animation, Preview & Unity", 1);
+    $g = FacePoseUIGrid($c);
+    button -parent $g -label "Create FacePoses Node" -command "FacePoseUICreateNode()";
+    button -parent $g -label "Solve Face Weights"    -command "FacePoseUISolve()";
+    button -parent $g -label "Connect Preview"       -command "FacePoseUIConnect()";
+    button -parent $g -label "Disconnect Preview"    -command "FacePoseUIDisconnect()";
+    button -parent $c -label "Cut Facial Bone Keys (destructive)" -command "FacePoseUICutKeys()";
+
+    // --- Transfer ---
+    $c = FacePoseUISection($main, "New Character Transfer (no control rig)", 1);
+    $g = FacePoseUIGrid($c);
+    button -parent $g -label "Export Raw Library..." -command "FacePoseUIExportRaw()";
+    button -parent $g -label "Transfer From Raw..."  -command "FacePoseUITransferRaw()";
+    text -parent $c -align "left" -label "Transfer keys onto frames from the Timeline Start frame.";
+
+    // --- Scripts ---
+    $c = FacePoseUISection($main, "Scripts", 0);
+    button -parent $c -label "Load Pipeline Scripts..." -command "FacePoseUILoadScripts()";
+
+    showWindow FacePoseUIWin;
+    FacePoseUIRefresh();
+}
+
+// auto-run: paste the whole file and the window opens
+FacePoseUI();

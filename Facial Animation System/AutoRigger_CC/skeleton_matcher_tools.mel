@@ -1,0 +1,1026 @@
+// ---------------------------------------------------------------------------
+// skeleton_matcher_tools.mel
+//
+// Builds YOUR game skeleton on top of ANY source skeleton (CC4 / AccuRig,
+// Mixamo, MetaHuman, Advanced Skeleton...) and copies its skin weights,
+// driven by Advanced Skeleton name matcher files instead of hardcoded tables.
+// Paste the entire file into the Script Editor (MEL tab) and execute: every
+// command gets defined and the "Skeleton Matcher Tools" window opens.
+//
+// The pieces:
+//   Name matcher (.txt)   How ONE rig names its joints, in Advanced Skeleton
+//                         format: side tokens, then Canonical=ThisRigsName.
+//                         Two matchers relate two rigs through the canonical
+//                         names (source -> canonical -> target).
+//   Skeleton template     Your game skeleton, captured once from a reference
+//   (.sktpl)              scene: hierarchy, jointOrient, rotateOrder, radius
+//                         and position per joint, plus #place rules for
+//                         joints the source can't supply.
+//
+// Workflow (each step is its own command and button):
+//   CaptureSkeletonTemplate("Root", "C:/path/VR_StandardPlayer.sktpl");
+//                         // once, in the reference skeleton scene
+//   // in the source character scene:
+//   BuildLocatorsFromSkeleton(template, targetMatcher, sourceMatcher, "CC_Base_BoneRoot");
+//   MirrorLocators("L", targetMatcher);      // optional, one-sided sources
+//   SetCustomOrient("UpperArm_L_loc", x, y, z);  // optional, per joint
+//   BuildSkeletonFromTemplate(template);
+//   RenameSkeletonByMatcher("CC_Base_BoneRoot", sourceMatcher, targetMatcher, 1);  // dry run
+//   RenameSkeletonByMatcher("CC_Base_BoneRoot", sourceMatcher, targetMatcher, 0);
+//   CopySkinByName("CC_Base_Body", "Body_Game", "Root");
+//   RestoreSkeletonNames("CC_Base_BoneRoot");
+//
+// Template file format (plain text):
+//   joint <name> <parent or -> <jox> <joy> <joz> <rotateOrder> <radius> <wx> <wy> <wz> <rx> <ry> <rz>
+//   #place <joint> origin
+//   #place <joint> at <joint>
+//   #place <joint> mid <jointA> <jointB>
+//   #place <joint> extend <jointA> <jointB> <factor>   // past B, along A->B
+//   #place <joint> src <sourceJoint>                  // a specific source joint
+// "{S}" in a #place line expands to both L and R. Rules name TARGET joints
+// (their locators), except "src", which names a joint on the source.
+//
+// Conventions: plain PascalCase procs, one self-contained file, forward
+// slashes in paths, plain ASCII only.
+// ---------------------------------------------------------------------------
+
+
+// ===========================================================================
+//  NAME MATCHERS (Advanced Skeleton format)
+//
+// IDENTICAL COPY in AutoRigger_CC/skeleton_matcher_tools.mel - change both
+// together. A matcher file looks like:
+//     sideRight=R
+//     sideLeft=L
+//     sideMiddle=
+//     sideBeforeName=0
+//     sideUnderScore=1
+//     Shoulder=UpperArm        <- Canonical=ThisRigsName
+// Parsed form (string array): [0] sideLeft [1] sideRight [2] sideMiddle
+// [3] sideBeforeName [4] sideUnderScore, then canonical,name pairs from [5].
+// ===========================================================================
+global proc string[] ReadNameMatcher(string $path)
+{
+    string $m[] = { "", "", "", "0", "0" };
+    int $fileId = `fopen $path "r"`;
+    if ($fileId == 0)
+        error("ReadNameMatcher: could not open (use forward slashes!): " + $path);
+
+    string $line = `fgetline $fileId`;
+    while (size($line) > 0)
+    {
+        string $t = strip($line);
+        $line = `fgetline $fileId`;
+        if ($t == "" || `gmatch $t "#*"` || `gmatch $t "//*"`) continue;
+
+        string $rawKey = `match "^[^=]*" $t`;
+        if (size($rawKey) == size($t)) continue;        // no "=" on this line
+        string $key = strip($rawKey);
+        string $val = "";
+        if (size($t) > size($rawKey) + 1)
+            $val = strip(substring($t, size($rawKey) + 2, size($t)));
+
+        if ($key == "sideLeft")            $m[0] = $val;
+        else if ($key == "sideRight")      $m[1] = $val;
+        else if ($key == "sideMiddle")     $m[2] = $val;
+        else if ($key == "sideBeforeName") $m[3] = $val;
+        else if ($key == "sideUnderScore") $m[4] = $val;
+        else if ($key != "" && $val != "")
+        {
+            $m[size($m)] = $key;
+            $m[size($m)] = $val;
+        }
+    }
+    fclose $fileId;
+    return $m;
+}
+
+// Full joint name from a matcher's base name and a side ("L", "R" or "M").
+global proc string MatcherBuildName(string $m[], string $base, string $side)
+{
+    string $tok = $m[2];
+    if ($side == "L") $tok = $m[0];
+    if ($side == "R") $tok = $m[1];
+    if ($tok == "") return $base;
+    string $sep = "";
+    if ($m[4] == "1") $sep = "_";
+    if ($m[3] == "1") return ($tok + $sep + $base);
+    return ($base + $sep + $tok);
+}
+
+// Joint name for a canonical name and side, or "" if the matcher lacks it.
+global proc string MatcherName(string $m[], string $canonical, string $side)
+{
+    for ($i = 5; $i + 1 < size($m); $i += 2)
+        if ($m[$i] == $canonical)
+            return MatcherBuildName($m, $m[$i + 1], $side);
+    return "";
+}
+
+// { canonical, side } for a joint name (namespace ignored), or empty.
+global proc string[] MatcherLookup(string $m[], string $jointName)
+{
+    string $none[];
+    string $leaf = `match "[^:|]*$" $jointName`;
+    string $sides[] = { "M", "L", "R" };
+    for ($i = 5; $i + 1 < size($m); $i += 2)
+    {
+        for ($s in $sides)
+        {
+            if (MatcherBuildName($m, $m[$i + 1], $s) == $leaf)
+            {
+                string $hit[] = { $m[$i], $s };
+                return $hit;
+            }
+        }
+    }
+    return $none;
+}
+
+
+// "L", "R" or "" (center) for a joint name, using a matcher: through the
+// canonical table when the name is in it, otherwise by the matcher's own
+// side tokens (so joints the matcher doesn't list, like Hand_Offset_L, work).
+global proc string MatcherSideOf(string $m[], string $name)
+{
+    string $hit[] = MatcherLookup($m, $name);
+    if (size($hit) == 2)
+    {
+        if ($hit[1] == "M") return "";
+        return $hit[1];
+    }
+    string $sep = "";
+    if ($m[4] == "1") $sep = "_";
+    string $sides[] = { "L", "R" };
+    for ($s in $sides)
+    {
+        string $tok = $m[0];
+        if ($s == "R") $tok = $m[1];
+        if ($tok == "") continue;
+        int $n = size($name);
+        int $t = size($tok) + size($sep);
+        if ($n <= $t) continue;
+        if ($m[3] == "1" && substring($name, 1, $t) == $tok + $sep) return $s;
+        if ($m[3] != "1" && substring($name, $n - $t + 1, $n) == $sep + $tok) return $s;
+    }
+    return "";
+}
+
+// The same joint name on the other side, or "" for center names.
+global proc string MatcherSwapSide(string $m[], string $name)
+{
+    string $side = MatcherSideOf($m, $name);
+    if ($side == "") return "";
+    string $hit[] = MatcherLookup($m, $name);
+    if (size($hit) == 2)
+    {
+        if ($side == "L") return MatcherName($m, $hit[0], "R");
+        return MatcherName($m, $hit[0], "L");
+    }
+    string $sep = "";
+    if ($m[4] == "1") $sep = "_";
+    string $tok = $m[0];
+    string $other = $m[1];
+    if ($side == "R") { $tok = $m[1]; $other = $m[0]; }
+    int $n = size($name);
+    int $t = size($tok) + size($sep);
+    if ($m[3] == "1")
+        return ($other + $sep + substring($name, $t + 1, $n));
+    return (substring($name, 1, $n - $t) + $sep + $other);
+}
+
+// Report canonical names one matcher has and the other lacks.
+global proc CheckMatchers(string $srcPath, string $tgtPath)
+{
+    string $src[] = ReadNameMatcher($srcPath);
+    string $tgt[] = ReadNameMatcher($tgtPath);
+    string $srcCan[];
+    string $tgtCan[];
+    for ($i = 5; $i + 1 < size($src); $i += 2) $srcCan[size($srcCan)] = $src[$i];
+    for ($i = 5; $i + 1 < size($tgt); $i += 2) $tgtCan[size($tgtCan)] = $tgt[$i];
+
+    string $both[];
+    string $onlySrc[];
+    string $onlyTgt[];
+    for ($c in $srcCan)
+    {
+        if (stringArrayContains($c, $tgtCan)) $both[size($both)] = $c;
+        else $onlySrc[size($onlySrc)] = $c;
+    }
+    for ($c in $tgtCan)
+        if (!stringArrayContains($c, $srcCan)) $onlyTgt[size($onlyTgt)] = $c;
+
+    print("\n============== CheckMatchers ==============\n");
+    print("Source: " + $srcPath + "\nTarget: " + $tgtPath + "\n");
+    print("Shared canonical names (" + size($both) + "):\n");
+    for ($c in $both)
+        print("  " + $c + ":  " + MatcherName($src, $c, "L") + " / " + MatcherName($src, $c, "M")
+              + "  ->  " + MatcherName($tgt, $c, "L") + " / " + MatcherName($tgt, $c, "M") + "\n");
+    if (size($onlySrc) > 0)
+        print("Only in SOURCE (not renamed / no locator source): " + stringArrayToString($onlySrc, ", ") + "\n");
+    if (size($onlyTgt) > 0)
+        print("Only in TARGET (needs a #place rule or falls back): " + stringArrayToString($onlyTgt, ", ") + "\n");
+    print("(L and M forms shown; R mirrors L.)\n");
+    print("===========================================\n\n");
+}
+
+
+// ===========================================================================
+//  SMALL HELPERS
+// ===========================================================================
+global proc string SkelLeaf(string $path)
+{
+    string $leaf = `match "[^|]*$" $path`;
+    return $leaf;
+}
+
+// Leaf name without namespace ("Character1:CC_Base_Hip" -> "CC_Base_Hip").
+global proc string SkelBareName(string $path)
+{
+    string $leaf = `match "[^:|]*$" $path`;
+    return $leaf;
+}
+
+// The root joint plus every joint below it, parents first, as full paths.
+global proc string[] SkelJointsUnder(string $root)
+{
+    string $out[];
+    string $top[] = `ls -long $root`;
+    if (size($top) != 1)
+        error("SkelJointsUnder: '" + $root + "' is missing or not unique.");
+    $out[0] = $top[0];
+    for ($i = 0; $i < size($out); $i++)
+    {
+        string $kids[] = `listRelatives -children -type joint -fullPath $out[$i]`;
+        for ($k in $kids) $out[size($out)] = $k;
+    }
+    return $out;
+}
+
+// Full path of the joint under $root whose bare name is $name, or "".
+global proc string SkelFindUnder(string $joints[], string $name)
+{
+    for ($j in $joints)
+        if (SkelBareName($j) == $name) return $j;
+    return "";
+}
+
+global proc string SkelFirstSelected(string $what)
+{
+    string $sel[] = `ls -selection -long`;
+    if (size($sel) == 0)
+        error("Select the " + $what + " first.");
+    return $sel[0];
+}
+
+
+// ===========================================================================
+//  SKELETON TEMPLATE
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Capture your game skeleton from a reference scene. Select its top joint:
+//   CaptureSkeletonTemplate("Root", "C:/path/VR_StandardPlayer.sktpl");
+// Existing #place rules and # notes in the file are kept, so they survive a
+// recapture.
+// ---------------------------------------------------------------------------
+global proc CaptureSkeletonTemplate(string $root, string $path)
+{
+    string $joints[] = SkelJointsUnder($root);
+
+    // keep the rules and notes already in the file (every "#" line except
+    // the two header lines this proc writes itself)
+    string $rules = "";
+    if (`filetest -r $path`)
+    {
+        int $in = `fopen $path "r"`;
+        string $line = `fgetline $in`;
+        while (size($line) > 0)
+        {
+            string $t = strip($line);
+            if (`gmatch $t "#*"` && !`gmatch $t "# Skeleton template captured*"`
+                && !`gmatch $t "# joint <name>*"`)
+                $rules += $t + "\n";
+            $line = `fgetline $in`;
+        }
+        fclose $in;
+    }
+
+    string $out = "# Skeleton template captured from '" + SkelLeaf($root) + "' ("
+                + size($joints) + " joints)\n";
+    $out += "# joint <name> <parent> <jox> <joy> <joz> <rotateOrder> <radius> <wx> <wy> <wz> <rx> <ry> <rz>\n";
+    $out += $rules;
+
+    string $seen[];
+    string $dupes[];
+    for ($j in $joints)
+    {
+        string $name = SkelBareName($j);
+        if (stringArrayContains($name, $seen)) $dupes[size($dupes)] = $name;
+        $seen[size($seen)] = $name;
+
+        string $parent = "-";
+        if ($j != $joints[0])
+        {
+            string $p[] = `listRelatives -parent -fullPath $j`;
+            $parent = SkelBareName($p[0]);
+        }
+        float $jo[] = `getAttr ($j + ".jointOrient")`;
+        float $r[]  = `getAttr ($j + ".rotate")`;
+        int $ro     = `getAttr ($j + ".rotateOrder")`;
+        float $rad  = `getAttr ($j + ".radius")`;
+        float $w[]  = `xform -q -ws -t $j`;
+
+        $out += "joint " + $name + " " + $parent + " " + $jo[0] + " " + $jo[1] + " " + $jo[2]
+              + " " + $ro + " " + $rad + " " + $w[0] + " " + $w[1] + " " + $w[2]
+              + " " + $r[0] + " " + $r[1] + " " + $r[2] + "\n";
+    }
+
+    int $fileId = `fopen $path "w"`;
+    if ($fileId == 0)
+        error("CaptureSkeletonTemplate: could not open for writing (use forward slashes!): " + $path);
+    fprint $fileId $out;
+    fclose $fileId;
+
+    print("CaptureSkeletonTemplate: " + size($joints) + " joints written to " + $path + "\n");
+    if (size($dupes) > 0)
+        warning("CaptureSkeletonTemplate: joint names used more than once: " + stringArrayToString($dupes, ", ") + ". Make them unique first.");
+}
+
+// Joint records, 13 strings each:
+//   name parent jox joy joz ro radius wx wy wz rx ry rz
+// (templates written before rx ry rz existed read with rotate 0 0 0).
+global proc string[] ReadSkeletonTemplate(string $path)
+{
+    string $rec[];
+    int $fileId = `fopen $path "r"`;
+    if ($fileId == 0)
+        error("ReadSkeletonTemplate: could not open (use forward slashes!): " + $path);
+    string $line = `fgetline $fileId`;
+    while (size($line) > 0)
+    {
+        string $tok[];
+        int $n = tokenize(strip($line), " ", $tok);
+        if (($n == 11 || $n == 14) && $tok[0] == "joint")
+        {
+            for ($i = 1; $i < 11; $i++) $rec[size($rec)] = $tok[$i];
+            for ($i = 11; $i < 14; $i++)
+            {
+                if ($n == 14) $rec[size($rec)] = $tok[$i];
+                else $rec[size($rec)] = "0";
+            }
+        }
+        $line = `fgetline $fileId`;
+    }
+    fclose $fileId;
+    if (size($rec) == 0)
+        error("ReadSkeletonTemplate: no joints in " + $path + ". Run CaptureSkeletonTemplate on the reference skeleton first.");
+    return $rec;
+}
+
+// #place rules with {S} expanded, one rule per entry: "joint type args...".
+global proc string[] ReadSkeletonRules(string $path)
+{
+    string $rules[];
+    int $fileId = `fopen $path "r"`;
+    if ($fileId == 0) return $rules;
+    string $line = `fgetline $fileId`;
+    while (size($line) > 0)
+    {
+        string $t = strip($line);
+        $line = `fgetline $fileId`;
+        if (!`gmatch $t "#place *"`) continue;
+        string $body = strip(substring($t, 8, size($t)));
+        if (`gmatch $body "*{S}*"`)
+        {
+            $rules[size($rules)] = substituteAllString($body, "{S}", "L");
+            $rules[size($rules)] = substituteAllString($body, "{S}", "R");
+        }
+        else
+            $rules[size($rules)] = $body;
+    }
+    fclose $fileId;
+    return $rules;
+}
+
+
+// ===========================================================================
+//  LOCATORS
+// ===========================================================================
+global proc string SkelLocatorGroup()
+{
+    if (!`objExists "SkeletonLocators_grp"`)
+        group -empty -name "SkeletonLocators_grp";
+    return "SkeletonLocators_grp";
+}
+
+// Creates <joint>_loc at a world position. Returns 0 if it already existed
+// (left where it is, so hand-placed locators survive a rerun).
+global proc int SkelMakeLocator(string $joint, float $p[])
+{
+    string $loc = $joint + "_loc";
+    if (`objExists $loc`) return 0;
+    string $made[] = `spaceLocator -name $loc`;
+    parent $made[0] (SkelLocatorGroup());
+    xform -worldSpace -translation $p[0] $p[1] $p[2] $loc;
+    return 1;
+}
+
+global proc float[] SkelLocatorPos(string $joint)
+{
+    float $none[];
+    string $loc = $joint + "_loc";
+    if (!`objExists $loc`) return $none;
+    float $p[] = `xform -q -worldSpace -translation $loc`;
+    return $p;
+}
+
+// ---------------------------------------------------------------------------
+// Place one locator per template joint on the SOURCE skeleton:
+//   template name -> canonical (target matcher) -> source name (source
+//   matcher) -> that source joint's world position.
+// Joints with a #place rule use the rule instead. Joints with neither keep
+// the template's offset from their parent, scaled to the source's size.
+//   BuildLocatorsFromSkeleton("C:/p/VR_StandardPlayer.sktpl",
+//       "C:/p/VR_StandardPlayer_NameMatcher.txt",
+//       "C:/p/CharacterCreator4_NameMatcher.txt", "CC_Base_BoneRoot");
+// ---------------------------------------------------------------------------
+global proc BuildLocatorsFromSkeleton(string $templatePath, string $targetMatcher,
+                                      string $sourceMatcher, string $sourceRoot)
+{
+    string $rec[]   = ReadSkeletonTemplate($templatePath);
+    string $rules[] = ReadSkeletonRules($templatePath);
+    string $tgtM[]  = ReadNameMatcher($targetMatcher);
+    string $srcM[]  = ReadNameMatcher($sourceMatcher);
+    string $srcJoints[] = SkelJointsUnder($sourceRoot);
+
+    string $report[];
+    string $placed[];             // joints that have a locator position now
+    float  $srcY[];
+    float  $tplY[];
+
+    // rule lookup: joint name -> rule text
+    string $ruleJoint[];
+    for ($r in $rules)
+    {
+        string $tok[];
+        tokenize($r, " ", $tok);
+        $ruleJoint[size($ruleJoint)] = $tok[0];
+    }
+
+    // ---- pass 1: joints the source supplies through the matchers ----
+    for ($i = 0; $i < size($rec); $i += 13)
+    {
+        string $name = $rec[$i];
+        if (stringArrayContains($name, $ruleJoint)) continue;
+
+        string $hit[] = MatcherLookup($tgtM, $name);
+        if (size($hit) != 2) continue;
+        string $srcName = MatcherName($srcM, $hit[0], $hit[1]);
+        if ($srcName == "")
+        {
+            $report[size($report)] = "NO SOURCE (" + $hit[0] + " not in source matcher): " + $name;
+            continue;
+        }
+        string $src = SkelFindUnder($srcJoints, $srcName);
+        if ($src == "")
+        {
+            $report[size($report)] = "MISSING SOURCE '" + $srcName + "': " + $name;
+            continue;
+        }
+        float $p[] = `xform -q -worldSpace -translation $src`;
+        if (SkelMakeLocator($name, $p))
+            $report[size($report)] = "OK: " + $name + "  <-  " + SkelLeaf($src);
+        else
+            $report[size($report)] = "KEPT (locator already exists): " + $name;
+        $placed[size($placed)] = $name;
+        float $lp[] = SkelLocatorPos($name);
+        $srcY[size($srcY)] = $lp[1];
+        $tplY[size($tplY)] = (float) $rec[$i + 8];
+    }
+
+    // ---- pass 2: #place rules, in file order ----
+    for ($r in $rules)
+    {
+        string $tok[];
+        int $n = tokenize($r, " ", $tok);
+        string $name = $tok[0];
+        string $type = "";
+        if ($n > 1) $type = $tok[1];
+        float $p[];
+        clear $p;
+        string $why = "";
+
+        if ($type == "origin")
+            $p = { 0.0, 0.0, 0.0 };
+        else if ($type == "at" && $n >= 3)
+            $p = SkelLocatorPos($tok[2]);
+        else if ($type == "mid" && $n >= 4)
+        {
+            float $a[] = SkelLocatorPos($tok[2]);
+            float $b[] = SkelLocatorPos($tok[3]);
+            if (size($a) == 3 && size($b) == 3)
+                $p = { ($a[0] + $b[0]) * 0.5, ($a[1] + $b[1]) * 0.5, ($a[2] + $b[2]) * 0.5 };
+        }
+        else if ($type == "extend" && $n >= 5)
+        {
+            float $a[] = SkelLocatorPos($tok[2]);
+            float $b[] = SkelLocatorPos($tok[3]);
+            float $f = (float) $tok[4];
+            if (size($a) == 3 && size($b) == 3)
+                $p = { $b[0] + ($b[0] - $a[0]) * $f, $b[1] + ($b[1] - $a[1]) * $f, $b[2] + ($b[2] - $a[2]) * $f };
+        }
+        else if ($type == "src" && $n >= 3)
+        {
+            string $src = SkelFindUnder($srcJoints, $tok[2]);
+            if ($src != "") $p = `xform -q -worldSpace -translation $src`;
+        }
+        else
+            $why = "unknown rule";
+
+        if (size($p) != 3)
+        {
+            if ($why == "") $why = "its reference locator/joint is missing";
+            $report[size($report)] = "RULE FAILED (" + $why + "): #place " + $r;
+            continue;
+        }
+        if (SkelMakeLocator($name, $p))
+            $report[size($report)] = "OK (rule): " + $name + "  <-  " + $r;
+        else
+            $report[size($report)] = "KEPT (locator already exists): " + $name;
+        $placed[size($placed)] = $name;
+    }
+
+    // ---- scale for fallbacks: height of the matched set, source vs template ----
+    float $scale = 1.0;
+    if (size($srcY) >= 2)
+    {
+        float $sMin = $srcY[0]; float $sMax = $srcY[0];
+        float $tMin = $tplY[0]; float $tMax = $tplY[0];
+        for ($k = 1; $k < size($srcY); $k++)
+        {
+            $sMin = min($sMin, $srcY[$k]); $sMax = max($sMax, $srcY[$k]);
+            $tMin = min($tMin, $tplY[$k]); $tMax = max($tMax, $tplY[$k]);
+        }
+        if ($tMax - $tMin > 0.0001) $scale = ($sMax - $sMin) / ($tMax - $tMin);
+    }
+
+    // ---- pass 3: everything else keeps its template offset from its parent ----
+    for ($i = 0; $i < size($rec); $i += 13)
+    {
+        string $name = $rec[$i];
+        if (stringArrayContains($name, $placed) || `objExists ($name + "_loc")`) continue;
+        string $parent = $rec[$i + 1];
+        float $w[] = { (float) $rec[$i + 7], (float) $rec[$i + 8], (float) $rec[$i + 9] };
+        float $p[] = { $w[0] * $scale, $w[1] * $scale, $w[2] * $scale };
+        float $pp[] = SkelLocatorPos($parent);
+        if (size($pp) == 3)
+        {
+            for ($k = 0; $k < size($rec); $k += 13)
+            {
+                if ($rec[$k] != $parent) continue;
+                $p = { $pp[0] + ($w[0] - (float) $rec[$k + 7]) * $scale,
+                       $pp[1] + ($w[1] - (float) $rec[$k + 8]) * $scale,
+                       $pp[2] + ($w[2] - (float) $rec[$k + 9]) * $scale };
+                break;
+            }
+        }
+        SkelMakeLocator($name, $p);
+        $placed[size($placed)] = $name;
+        $report[size($report)] = "FALLBACK (template offset from parent, x" + $scale + "): " + $name;
+    }
+
+    // ---- report ----
+    int $ok = 0;
+    print("\n--- BuildLocatorsFromSkeleton report ---\n");
+    for ($line in $report)
+    {
+        print($line + "\n");
+        if (`gmatch $line "OK*"`) $ok++;
+    }
+    print("\nPositioned from the source: " + $ok + " / " + (size($rec) / 13) + "\n");
+    print("Review FALLBACK / MISSING / FAILED lines and nudge those locators by hand.\n");
+    print("----------------------------------------\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Copy one side's locators to the other side, mirrored across world X.
+// Overwrites the other side's positions. Uses the TARGET matcher's side
+// naming (your skeleton's names):
+//   MirrorLocators("L", "C:/p/VR_StandardPlayer_NameMatcher.txt");
+// ---------------------------------------------------------------------------
+global proc MirrorLocators(string $fromSide, string $targetMatcher)
+{
+    if ($fromSide != "L" && $fromSide != "R")
+        error "MirrorLocators: side must be \"L\" or \"R\".";
+    string $m[] = ReadNameMatcher($targetMatcher);
+    string $locs[] = `ls -type transform "*_loc"`;
+    int $count = 0;
+    for ($loc in $locs)
+    {
+        string $joint = substring($loc, 1, size($loc) - 4);
+        if (MatcherSideOf($m, $joint) != $fromSide) continue;
+        string $other = MatcherSwapSide($m, $joint);
+        if ($other == "") continue;
+
+        float $p[] = `xform -q -worldSpace -translation $loc`;
+        float $q[] = { -$p[0], $p[1], $p[2] };
+        string $otherLoc = $other + "_loc";
+        if (!SkelMakeLocator($other, $q))
+            xform -worldSpace -translation $q[0] $q[1] $q[2] $otherLoc;
+        $count++;
+    }
+    print("MirrorLocators: " + $count + " locators mirrored from side " + $fromSide + ".\n");
+}
+
+// ---------------------------------------------------------------------------
+// Per-locator orientation override, for a limb that must deviate from the
+// template (e.g. an intentionally different arm). Degrees.
+//   SetCustomOrient("UpperArm_L_loc", 0.97, -2.6, -24.6);
+// ---------------------------------------------------------------------------
+global proc SetCustomOrient(string $locName, float $x, float $y, float $z)
+{
+    if (!`objExists $locName`)
+        error("SetCustomOrient: locator does not exist: " + $locName);
+    if (!`attributeQuery -node $locName -exists "customOrient"`)
+    {
+        addAttr -ln "customOrient" -at "double3" $locName;
+        addAttr -ln "customOrientX" -at "double" -p "customOrient" $locName;
+        addAttr -ln "customOrientY" -at "double" -p "customOrient" $locName;
+        addAttr -ln "customOrientZ" -at "double" -p "customOrient" $locName;
+    }
+    setAttr ($locName + ".customOrient") $x $y $z;
+    print("SetCustomOrient: " + $locName + " = " + $x + " " + $y + " " + $z + "\n");
+}
+
+
+// ===========================================================================
+//  BUILD THE SKELETON
+// ---------------------------------------------------------------------------
+// Creates every template joint at its locator, parents it per the template,
+// then sets its jointOrient and rotate (or the locator's customOrient with
+// rotate zeroed), rotateOrder and radius - in that order, so positions land
+// exactly on the locators whatever the orientation. Orientation always
+// comes from the reference skeleton's real values, never from aiming.
+//   BuildSkeletonFromTemplate("C:/p/VR_StandardPlayer.sktpl");
+// ===========================================================================
+global proc BuildSkeletonFromTemplate(string $templatePath)
+{
+    string $rec[] = ReadSkeletonTemplate($templatePath);
+    string $built[];
+    string $skipped[];
+    int $made = 0;
+
+    for ($i = 0; $i < size($rec); $i += 13)
+    {
+        string $name = $rec[$i];
+        string $loc = $name + "_loc";
+        if (!`objExists $loc`)
+        {
+            $skipped[size($skipped)] = $name;
+            continue;
+        }
+        if (`objExists $name`)
+        {
+            warning("BuildSkeletonFromTemplate: '" + $name + "' already exists - skipped. Delete the old skeleton first.");
+            continue;
+        }
+
+        // nearest built ancestor (skips joints whose locator was missing)
+        string $parent = $rec[$i + 1];
+        while ($parent != "-" && !stringArrayContains($parent, $built))
+        {
+            string $up = "-";
+            for ($k = 0; $k < size($rec); $k += 13)
+                if ($rec[$k] == $parent) { $up = $rec[$k + 1]; break; }
+            $parent = $up;
+        }
+
+        float $pos[] = `xform -q -worldSpace -translation $loc`;
+        select -clear;
+        joint -position $pos[0] $pos[1] $pos[2] -name $name;
+        if ($parent != "-") parent $name $parent;
+
+        float $jo[] = { (float) $rec[$i + 2], (float) $rec[$i + 3], (float) $rec[$i + 4] };
+        float $rot[] = { (float) $rec[$i + 10], (float) $rec[$i + 11], (float) $rec[$i + 12] };
+        if (`attributeQuery -node $loc -exists "customOrient"`)
+        {
+            $jo = `getAttr ($loc + ".customOrient")`;
+            $rot = { 0.0, 0.0, 0.0 };
+        }
+        setAttr ($name + ".rotate") $rot[0] $rot[1] $rot[2];
+        setAttr ($name + ".jointOrient") $jo[0] $jo[1] $jo[2];
+        setAttr ($name + ".rotateOrder") ((int) $rec[$i + 5]);
+        setAttr ($name + ".radius") ((float) $rec[$i + 6]);
+
+        $built[size($built)] = $name;
+        $made++;
+    }
+    select -clear;
+
+    print("BuildSkeletonFromTemplate: " + $made + " joints built.\n");
+    if (size($skipped) > 0)
+        warning("BuildSkeletonFromTemplate: no locator for " + stringArrayToString($skipped, ", ") + " - not built (their children went under the nearest built joint).");
+}
+
+
+// ===========================================================================
+//  SKIN WEIGHTS
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Rename the SOURCE skeleton to your skeleton's names, so Copy Skin Weights
+// can match influences by name. Every joint under the root that both
+// matchers know is renamed; everything else is left untouched and listed.
+// Each renamed joint remembers its old name (RestoreSkeletonNames undoes it).
+//   RenameSkeletonByMatcher("CC_Base_BoneRoot", ccMatcher, vrMatcher, 1);  // dry run
+// ---------------------------------------------------------------------------
+global proc RenameSkeletonByMatcher(string $root, string $fromMatcher, string $toMatcher, int $dryRun)
+{
+    string $fromM[] = ReadNameMatcher($fromMatcher);
+    string $toM[]   = ReadNameMatcher($toMatcher);
+    string $joints[] = SkelJointsUnder($root);
+
+    string $plannedJoint[];
+    string $plannedName[];
+    string $untouched[];
+    string $clash[];
+
+    for ($j in $joints)
+    {
+        string $bare = SkelBareName($j);
+        string $hit[] = MatcherLookup($fromM, $bare);
+        string $newName = "";
+        if (size($hit) == 2) $newName = MatcherName($toM, $hit[0], $hit[1]);
+        if ($newName == "" || $newName == $bare)
+        {
+            if ($newName == "") $untouched[size($untouched)] = $bare;
+            continue;
+        }
+        if (stringArrayContains($newName, $plannedName))
+        {
+            $clash[size($clash)] = $bare + " -> " + $newName;
+            continue;
+        }
+        $plannedJoint[size($plannedJoint)] = $j;
+        $plannedName[size($plannedName)] = $newName;
+    }
+
+    print("\n--- RenameSkeletonByMatcher" + ($dryRun ? " (DRY RUN - nothing renamed)" : "") + " ---\n");
+    // rename children first so the parent paths stored above stay valid
+    for ($i = size($plannedJoint) - 1; $i >= 0; $i--)
+    {
+        string $j = $plannedJoint[$i];
+        string $bare = SkelLeaf($j);
+        print("  " + $bare + " -> " + $plannedName[$i] + "\n");
+        if ($dryRun) continue;
+        if (!`attributeQuery -node $j -exists "matcherOrigName"`)
+            addAttr -ln "matcherOrigName" -dt "string" $j;
+        setAttr -type "string" ($j + ".matcherOrigName") $bare;
+        rename $j $plannedName[$i];
+    }
+    print((size($plannedJoint)) + " joints " + ($dryRun ? "would be" : "were") + " renamed.\n");
+    if (size($untouched) > 0)
+        print("Left untouched (not in both matchers): " + stringArrayToString($untouched, ", ") + "\n");
+    if (size($clash) > 0)
+        warning("RenameSkeletonByMatcher: more than one joint maps to the same name, extra ones skipped: " + stringArrayToString($clash, ", "));
+    print("---------------------------------------\n\n");
+}
+
+// Undo RenameSkeletonByMatcher on everything under the (renamed) root.
+global proc RestoreSkeletonNames(string $root)
+{
+    string $joints[] = SkelJointsUnder($root);
+    int $count = 0;
+    for ($i = size($joints) - 1; $i >= 0; $i--)
+    {
+        string $j = $joints[$i];
+        if (!`attributeQuery -node $j -exists "matcherOrigName"`) continue;
+        string $orig = `getAttr ($j + ".matcherOrigName")`;
+        deleteAttr ($j + ".matcherOrigName");
+        rename $j $orig;
+        $count++;
+    }
+    print("RestoreSkeletonNames: " + $count + " joints renamed back.\n");
+}
+
+// ---------------------------------------------------------------------------
+// Copy skin weights from the source mesh (skinned to the renamed source
+// skeleton) to the target mesh, matching influences by joint NAME, then by
+// closest joint for anything left over. If the target mesh isn't skinned
+// yet, it is bound to every joint under $targetRoot first.
+//   CopySkinByName("CC_Base_Body", "Body_Game", "Root");
+// ---------------------------------------------------------------------------
+global proc CopySkinByName(string $sourceMesh, string $targetMesh, string $targetRoot)
+{
+    string $srcSC = `findRelatedSkinCluster $sourceMesh`;
+    if ($srcSC == "")
+        error("CopySkinByName: '" + $sourceMesh + "' has no skinCluster.");
+
+    string $dstSC = `findRelatedSkinCluster $targetMesh`;
+    if ($dstSC == "")
+    {
+        string $joints[] = SkelJointsUnder($targetRoot);
+        string $res[] = `skinCluster -toSelectedBones -bindMethod 0 -normalizeWeights 1 $joints $targetMesh`;
+        $dstSC = $res[0];
+        print("CopySkinByName: bound '" + $targetMesh + "' to " + size($joints) + " joints under '" + $targetRoot + "'.\n");
+    }
+
+    copySkinWeights -sourceSkin $srcSC -destinationSkin $dstSC -noMirror
+                    -surfaceAssociation closestPoint
+                    -influenceAssociation name -influenceAssociation closestJoint;
+
+    string $srcInf[] = `skinCluster -q -influence $srcSC`;
+    string $dstInf[] = `skinCluster -q -influence $dstSC`;
+    string $dstBare[];
+    for ($d in $dstInf) $dstBare[size($dstBare)] = SkelBareName($d);
+    string $noMatch[];
+    for ($s in $srcInf)
+        if (!stringArrayContains(SkelBareName($s), $dstBare)) $noMatch[size($noMatch)] = SkelBareName($s);
+
+    print("CopySkinByName: weights copied " + $sourceMesh + " -> " + $targetMesh + ".\n");
+    if (size($noMatch) > 0)
+        print("Source influences with no same-named target joint (went to the closest joint): "
+              + stringArrayToString($noMatch, ", ") + "\n");
+}
+
+
+// ===========================================================================
+//  WINDOW
+//
+//   SkeletonMatcherUI();   // opens on paste
+//
+// Every button runs the same command you would type, echoed in the Script
+// Editor.
+// ===========================================================================
+global proc SkelUIRun(string $cmd)
+{
+    catch(evalEcho($cmd));
+}
+
+global proc string SkelUIField(string $field)
+{
+    string $v = strip(`textFieldButtonGrp -q -text $field`);
+    optionVar -stringValue $field $v;
+    if ($v == "")
+        error("Fill in the '" + `textFieldButtonGrp -q -label $field` + "' field first.");
+    return $v;
+}
+
+global proc SkelUIBrowse(string $field, string $filter, int $save)
+{
+    int $mode = 1;
+    if ($save) $mode = 0;
+    string $p[] = `fileDialog2 -fileMode $mode -fileFilter $filter`;
+    if (size($p) == 0) return;
+    string $path = fromNativePath($p[0]);
+    textFieldButtonGrp -e -text $path $field;
+    optionVar -stringValue $field $path;
+}
+
+global proc string SkelUIOptionVar(string $name)
+{
+    if (`optionVar -exists $name`) return `optionVar -q $name`;
+    return "";
+}
+
+global proc SkelUICheckMatchers()
+{
+    SkelUIRun("CheckMatchers(\"" + SkelUIField("SkelUISrcMatcher") + "\", \"" + SkelUIField("SkelUITgtMatcher") + "\");");
+}
+
+global proc SkelUICaptureTemplate()
+{
+    string $root = SkelLeaf(SkelFirstSelected("reference skeleton's top joint"));
+    SkelUIRun("CaptureSkeletonTemplate(\"" + $root + "\", \"" + SkelUIField("SkelUITemplate") + "\");");
+}
+
+global proc SkelUIBuildLocators()
+{
+    string $root = SkelLeaf(SkelFirstSelected("source skeleton's top joint"));
+    SkelUIRun("BuildLocatorsFromSkeleton(\"" + SkelUIField("SkelUITemplate") + "\", \""
+              + SkelUIField("SkelUITgtMatcher") + "\", \"" + SkelUIField("SkelUISrcMatcher") + "\", \"" + $root + "\");");
+}
+
+global proc SkelUIMirror(string $side)
+{
+    SkelUIRun("MirrorLocators(\"" + $side + "\", \"" + SkelUIField("SkelUITgtMatcher") + "\");");
+}
+
+global proc SkelUICustomOrient()
+{
+    string $loc = SkelLeaf(SkelFirstSelected("locator"));
+    float $v[] = `floatFieldGrp -q -value SkelUIOrient`;
+    SkelUIRun("SetCustomOrient(\"" + $loc + "\", " + $v[0] + ", " + $v[1] + ", " + $v[2] + ");");
+}
+
+global proc SkelUIBuildSkeleton()
+{
+    SkelUIRun("BuildSkeletonFromTemplate(\"" + SkelUIField("SkelUITemplate") + "\");");
+}
+
+global proc SkelUIRename()
+{
+    string $root = SkelLeaf(SkelFirstSelected("source skeleton's top joint"));
+    int $dry = `checkBox -q -value SkelUIDryRun`;
+    SkelUIRun("RenameSkeletonByMatcher(\"" + $root + "\", \"" + SkelUIField("SkelUISrcMatcher") + "\", \""
+              + SkelUIField("SkelUITgtMatcher") + "\", " + $dry + ");");
+}
+
+global proc SkelUIRestore()
+{
+    string $root = SkelLeaf(SkelFirstSelected("renamed source skeleton's top joint"));
+    SkelUIRun("RestoreSkeletonNames(\"" + $root + "\");");
+}
+
+global proc SkelUICopySkin()
+{
+    string $sel[] = `ls -selection`;
+    if (size($sel) != 2)
+        error "Select the SOURCE mesh, then the TARGET mesh.";
+    string $rec[] = ReadSkeletonTemplate(SkelUIField("SkelUITemplate"));
+    SkelUIRun("CopySkinByName(\"" + $sel[0] + "\", \"" + $sel[1] + "\", \"" + $rec[0] + "\");");
+}
+
+global proc SkelUIFileField(string $parent, string $name, string $label, string $filter, int $save)
+{
+    textFieldButtonGrp -parent $parent -label $label -buttonLabel "..."
+                       -text (SkelUIOptionVar($name))
+                       -columnWidth3 100 260 30 -adjustableColumn 2
+                       -buttonCommand ("SkelUIBrowse(\"" + $name + "\", \"" + $filter + "\", " + $save + ")") $name;
+}
+
+global proc string SkelUISection(string $parent, string $label)
+{
+    frameLayout -parent $parent -label $label -collapsable true -collapse false
+                -marginWidth 4 -marginHeight 4;
+    string $col = `columnLayout -adjustableColumn true -rowSpacing 3`;
+    return $col;
+}
+
+global proc string SkelUIGrid(string $parent)
+{
+    string $g = `gridLayout -parent $parent -numberOfColumns 2 -cellWidthHeight 200 26`;
+    return $g;
+}
+
+global proc SkeletonMatcherUI()
+{
+    if (`window -exists SkelUIWin`) deleteUI SkelUIWin;
+    window -title "Skeleton Matcher Tools" -widthHeight 430 640 -sizeable true SkelUIWin;
+    scrollLayout -childResizable true;
+    string $main = `columnLayout -adjustableColumn true -rowSpacing 4`;
+
+    string $c = SkelUISection($main, "1. Matchers and Template");
+    SkelUIFileField($c, "SkelUISrcMatcher", "Source matcher", "Name matcher (*.txt)", 0);
+    SkelUIFileField($c, "SkelUITgtMatcher", "Target matcher", "Name matcher (*.txt)", 0);
+    SkelUIFileField($c, "SkelUITemplate",   "Template",       "Skeleton template (*.sktpl)", 1);
+    string $g = SkelUIGrid($c);
+    button -parent $g -label "Check Matchers"          -command "SkelUICheckMatchers()";
+    button -parent $g -label "Capture Template"        -command "SkelUICaptureTemplate()";
+    text -parent $c -align "left" -label "Source = the character you copy from (e.g. CC4). Target = your skeleton.";
+    text -parent $c -align "left" -label "Capture Template: select your reference skeleton's top joint.";
+
+    $c = SkelUISection($main, "2. Locators  (in the source character scene)");
+    button -parent $c -label "Build Locators (select source top joint)" -command "SkelUIBuildLocators()";
+    $g = SkelUIGrid($c);
+    button -parent $g -label "Mirror Locators L -> R"  -command "SkelUIMirror(\"L\")";
+    button -parent $g -label "Mirror Locators R -> L"  -command "SkelUIMirror(\"R\")";
+    floatFieldGrp -parent $c -numberOfFields 3 -label "Custom orient" -precision 3
+                  -columnWidth4 100 80 80 80 SkelUIOrient;
+    button -parent $c -label "Set Custom Orient on Selected Locator" -command "SkelUICustomOrient()";
+
+    $c = SkelUISection($main, "3. Skeleton");
+    button -parent $c -label "Build Skeleton From Template" -command "SkelUIBuildSkeleton()";
+
+    $c = SkelUISection($main, "4. Skin Weights");
+    checkBox -parent $c -label "Dry run (print only)" -value 1 SkelUIDryRun;
+    $g = SkelUIGrid($c);
+    button -parent $g -label "Rename Source to Target" -command "SkelUIRename()";
+    button -parent $g -label "Restore Source Names"    -command "SkelUIRestore()";
+    button -parent $c -label "Copy Skin (select source mesh, then target mesh)" -command "SkelUICopySkin()";
+    text -parent $c -align "left" -label "Rename/Restore: select the source skeleton's top joint.";
+
+    showWindow SkelUIWin;
+}
+
+
+// ---------------------------------------------------------------------------
+global proc SkeletonMatcherHelp()
+{
+    print("\n============ skeleton_matcher_tools.mel ============\n");
+    print("Window: SkeletonMatcherUI();  (opens automatically)\n");
+    print("  CheckMatchers(srcMatcher, tgtMatcher);\n");
+    print("  CaptureSkeletonTemplate(\"Root\", \"C:/p/My.sktpl\");     // reference scene\n");
+    print("  BuildLocatorsFromSkeleton(template, tgtMatcher, srcMatcher, srcRoot);\n");
+    print("  MirrorLocators(\"L\", tgtMatcher);  SetCustomOrient(loc, x, y, z);\n");
+    print("  BuildSkeletonFromTemplate(template);\n");
+    print("  RenameSkeletonByMatcher(srcRoot, srcMatcher, tgtMatcher, 1);   // 1 = dry run\n");
+    print("  CopySkinByName(srcMesh, tgtMesh, tgtRoot);\n");
+    print("  RestoreSkeletonNames(srcRoot);\n");
+    print("Paths: ALWAYS forward slashes.\n");
+    print("====================================================\n\n");
+}
+
+SkeletonMatcherHelp();
+SkeletonMatcherUI();
